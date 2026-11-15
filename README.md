@@ -1,8 +1,9 @@
 # MAME MCP (proof of concept)
 
-A local MAME Lua plugin, a small Python bridge client, and an MCP (stdio) server that let an agent run
-bounded, repeatable debugger experiments against a **separately launched, isolated** MAME instance and
-get structured evidence back, instead of writing ad hoc scripts or pulling huge traces into the conversation.
+A local MAME Lua plugin, a small Python bridge client, and an MCP (stdio) server that let an agent start an
+**isolated** MAME, run bounded, repeatable debugger experiments against it and get structured evidence back,
+instead of writing ad hoc scripts or pulling huge traces into the conversation. The agent starts and stops the
+game itself (`start_session` / `stop_session`); nobody has to launch MAME by hand.
 
 Status: POC. See [docs/VALIDATION.md](docs/VALIDATION.md) for what was proven, what failed along the way and
 what is untested. Game-specific addresses live only in the experiment scripts, never in the server.
@@ -30,7 +31,54 @@ Nothing is installed into, or changed in, `D:\arcade\mame`. The plugin is loaded
 read, for `boot.lua` and the bundled `json` library). All writable state (home, ini, cfg, nvram, snapshots,
 evidence, `debug.log`) is under a run directory in `runs\` (git-ignored).
 
-## Launch an isolated MAME
+## Everyday workflow (register once, then just ask)
+
+Register the server **once** at user scope. Claude Code then starts the Python MCP server by itself whenever it needs it;
+you never run MAME or the server in PowerShell.
+
+```powershell
+claude mcp add mame --scope user -e "MAMEMCP_MAME_DIR=D:\arcade\mame" -e "MAMEMCP_ROMPATH=D:\arcade\ROMs\MAME 0.289 ROMs (merged)" -- C:\Users\MatthewMcKinnon\git\mame-mcp\.venv\Scripts\python.exe -I -m mame_mcp.server
+claude mcp get mame        # verify; a running Claude Code session must be restarted (or /mcp reconnected) to load it
+```
+The registration holds only machine-local defaults (see [docs/mcp-client-config.example.json](docs/mcp-client-config.example.json)). It does **not**
+need a running MAME, a PID, a `launch.json` or a run directory.
+
+Automatic server startup and explicit game startup are separate steps:
+
+| | When | What happens |
+|---|---|---|
+| **Automatic: MCP-server startup** | Claude Code starts the server (session start / reconnect) | The server initialises with **no MAME running**. `session_info` works and reports `no_session`; bridge tools answer `no_session`. No emulator is launched. |
+| **Explicit: `start_session`** | you ask for a game ("start shinobi") | A fresh run directory is created and an isolated MAME with the production plugin and the debugger is launched; the bridge is connected and the wake identity is configured from the launch result. MAME starts **stopped in the debugger**: use `execution_control resume`. |
+| **Explicit: `stop_session`** | you ask to stop | Any active capture is cancelled, verified and finalised (execution state untouched), then only the MAME this server launched is stopped, after its identity is verified. |
+
+Typical conversation: *start shinobi, resume it, capture 30 hits at 0x404 on `:maincpu` recording D0 and SR, show me the summary, stop the game.*
+
+Session states (`session_info.session.state`): `no_session`, `starting`, `ready`, `stopping`, `exited` (MAME ended unexpectedly; stays visible until `stop_session` or the next `start_session`) and
+`failed` (`start_session` failed; diagnostics are in the error and in `session.failure`). After a normal stop the state is `no_session` and `session.last_session` summarises the previous run.
+
+Machine-local configuration (server environment; none of it can be set through tool arguments):
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `MAMEMCP_MAME_DIR` | folder containing `mame.exe` | `D:\arcade\mame` (or `MAME_DIR`) |
+| `MAMEMCP_ROMPATH` | ROM directories, `;`-separated; the first holding `<system>.zip`/`.7z`/folder is used (a clone's parent set must be in the same directory) | `<MAMEMCP_MAME_DIR>\roms` |
+| `MAMEMCP_RUNS_DIR` | parent of the per-session run directories (`<system>-<date>-<time>-<id>\{home,evidence,launch.json,mame_stdout.txt}`) | `<repo>\runs\sessions` (git-ignored) |
+
+Shinobi: `D:\arcade\ROMs\MAME 0.289 ROMs (merged)\shinobi.zip` and `D:\arcade\mame\roms\shinobi.zip` are byte-identical (SHA-1 `a7a0ce96...`) and both pass `-verifyroms`;
+the merged collection is configured because it also holds other games.
+
+**Ownership.** A session is *managed* (started by this server, so this server may stop it) or *external* (below: never started, stopped or killed by this server).
+`stop_session` and shutdown terminate only the `Popen` object this server created, and only after checking that its image is the configured `mame.exe`, its creation time is the recorded one and it owns this
+session's bridge port; if a check fails the process is left alone and the refusal is reported. One managed session at a time (`start_session` is refused while one is `starting`, `ready` or `stopping`).
+Lifecycle changes are serialised against captures and execution control: `stop_session` waits (up to 20 s) for calls already in flight, and calls made while a session is starting or stopping are refused, not queued.
+When the MCP server shuts down normally (stdin closed, Ctrl+C, SIGTERM/SIGBREAK) it cancels an active capture and stops its MAME with bounded waits (a few seconds in total).
+**A forced kill of the MCP server (Task Manager, `TerminateProcess`) runs no cleanup and can leave its MAME running**; find it by command line (see Cleanup).
+Production sessions never load the test-only fixture plugin and never inherit `MAMEMCP_TEST_*` hooks (the launcher strips them, and `start_session` refuses a session whose `session_info.test_hooks` is not empty).
+
+## Launch an isolated MAME by hand (optional: external attachment)
+
+The original workflow still works and is **external**: the server attaches to a MAME you started yourself and never owns it. It is enabled **only** when `MAMEMCP_PORT` is set
+(the one behaviour change: without it the server no longer implicitly tries port 9411). While a managed session exists it takes precedence; after `stop_session` the external attachment is used again.
 
 ```powershell
 .\.venv\Scripts\python -m mame_mcp.launcher --system shinobi --port 9411
@@ -49,17 +97,20 @@ Direct bridge smoke test (launches and kills its own MAME):
 .\.venv\Scripts\python -I scripts\bridge_smoke.py
 ```
 
-MCP server (normally started by your MCP client; stdout = protocol, stderr = diagnostics):
+MCP server (normally started by your MCP client; stdout = protocol, stderr = diagnostics). Managed sessions need nothing beyond the registration above;
+`MAMEMCP_PORT` (plus optional `MAMEMCP_MAME_PID` / `MAMEMCP_LAUNCH_INFO`) is only for attaching to a hand-launched MAME:
 ```powershell
 $env:MAMEMCP_PORT = "9411"; .\.venv\Scripts\python -I -m mame_mcp.server
 ```
-Client configuration snippet (not applied anywhere): [docs/mcp-client-config.example.json](docs/mcp-client-config.example.json).
+Client configuration snippets: [docs/mcp-client-config.example.json](docs/mcp-client-config.example.json).
 
 ### Tools
 
 | Tool | Purpose |
 |---|---|
-| `session_info` | MAME version, machine, CPU tags, address spaces, installed breakpoints (with ownership), execution state `running`/`paused`/`debugger_stopped`, ROM identity, bridge limits |
+| `start_session(system, ready_timeout_s=60)` | launch an isolated MAME for a MAME short name (`shinobi`), debugger on, production plugin only; wait (bounded, 5..120 s) for the bridge; returns session id, machine identity, execution state and run/evidence directories. Refused while a managed session is active. No executable, path or MAME-argument parameters |
+| `stop_session()` | cancel an active capture (verified), then stop only the server-launched MAME after identity verification; reports capture cleanup, exit code and any cleanup failures; no-op without a session |
+| `session_info` | **session state, ownership, ids, directories and exit diagnostics (works with no MAME, while starting and after exit)** and, when connected: MAME version, machine, CPU tags, address spaces, installed breakpoints (with ownership), execution state `running`/`paused`/`debugger_stopped`, ROM identity, bridge limits |
 | `read_memory(cpu, address, length, space="program", mode="inspect")` | 1..4096 bytes, hex string, ascending order. `inspect` = MAME's side-effects-disabled debugger read (default); `direct` = program-space pointer read, no handler invoked (zeros where no pointer). Result states `read_mode`, `side_effects`, `limitations`. Addresses are CPU-visible **logical** addresses: on banked machines the bytes depend on the entry selected at that moment. `bank_context=true` (opt-in) adds the selected entry of every memory bank, sampled in the same plugin call as the bytes; it does **not** say which bank backs the range or which ROM offset an entry maps to |
 | `read_registers(cpu, registers?)` | exact register names; `hex` and decimal-string values |
 | `capture_breakpoint(cpu, max_events, max_wall_seconds, address? \| locations?, registers?, memory?, label?)` | asynchronous, both limits mandatory; give **exactly one** of `address` (single breakpoint, legacy form) or `locations` = 1..8 `{address, id?}` on the one named `cpu` (ids `[A-Za-z][A-Za-z0-9_]{0,23}`, default `L1..Ln`; duplicate ids/addresses rejected before anything is installed). One experiment = one CPU, one global event limit/wall limit/sequence. Every event carries `location`, `address` (logical) and `pc` (hit-time); memory fields `{space, address, size}` are read from `cpu`; never changes execution state (armed while paused/stopped = records nothing until resumed); borrows shared debugger temps (multi-location uses one extra temp for the hit-time PC, independent of the number of locations) and reports which; returns an experiment id, `all_armed` and the per-location arming outcome |
@@ -67,7 +118,7 @@ Client configuration snippet (not applied anywhere): [docs/mcp-client-config.exa
 | `cancel_experiment(experiment_id)` | removes only that experiment's breakpoint, verifies, finalises evidence |
 | `execution_control(action)` | `pause` / `resume` only (needed to leave the initial debugger stop) |
 
-Deliberately absent: Lua evaluation, shell, general debugger-command tool.
+Deliberately absent: Lua evaluation, shell, general debugger-command tool, arbitrary executable / MAME-argument parameters.
 
 ### Reproducible example experiment
 
@@ -82,12 +133,13 @@ Evidence: `runs\example\run\evidence\exp-*\{manifest.json,events.jsonl}`.
 ## Tests and validation
 
 ```powershell
-.\.venv\Scripts\python -m pytest -q                              # 50 unit tests (fake sockets / fake process table; NOT MAME evidence)
+.\.venv\Scripts\python -m pytest -q                              # 97 unit tests (fake sockets / process / process table; NOT MAME evidence), incl. session lifecycle and ownership
 .\.venv\Scripts\python -I scripts\validate.py                    # 51 regression checks vs real MAME (Shinobi)
 .\.venv\Scripts\python -I scripts\validate_hardening.py          # 100 checks: temp ownership, execution-state matrix, Z80 (incl. hit-time register observation), read semantics
 .\.venv\Scripts\python -I scripts\validate_latency.py --gaps 1,6,12 --reps 2   # debugger-stopped latency (measured), stale replies, retries
 .\.venv\Scripts\python -I scripts\mcp_e2e.py                     # 13 checks through the official MCP SDK client
-.\.venv\Scripts\python -I scripts\mcp_restart_e2e.py             # 22 checks: one MCP server across MAME restarts
+.\.venv\Scripts\python -I scripts\mcp_session_e2e.py             # 40 checks: managed sessions through the MCP client (start/capture/stop/start, unexpected exit, startup failure, shutdown)
+.\.venv\Scripts\python -I scripts\mcp_restart_e2e.py             # 22 checks: one MCP server across MAME restarts (external attachment)
 .\.venv\Scripts\python -I scripts\validate_banked.py             # 42 checks: banked memory on 1942 (Revision B), Z80 :maincpu
 .\.venv\Scripts\python -I scripts\mcp_bank_e2e.py                # 8 checks: bank-switch example through the MCP client
 .\.venv\Scripts\python -I scripts\validate_multi.py             # 67 checks: multi-address capture (1942 Z80 + Shinobi 68000), unequal rates, cleanup-failure/recovery (test-only hooks)
@@ -134,7 +186,7 @@ See [docs/VALIDATION.md](docs/VALIDATION.md) for what passed, what is a limitati
 ## Cleanup
 
 ```powershell
-Get-CimInstance Win32_Process -Filter "Name='mame.exe'" | Select ProcessId,CommandLine   # find YOUR test instances (check the command line!)
+Get-CimInstance Win32_Process -Filter "Name='mame.exe'" | Select ProcessId,CommandLine   # find YOUR instances (managed ones run from runs\sessions\ in the command line)
 Stop-Process -Id <pid-of-your-test-instance>
 Remove-Item -Recurse -Force .\runs                                                          # isolated config + evidence
 deactivate; Remove-Item -Recurse -Force .\.venv                                             # optional

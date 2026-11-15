@@ -71,3 +71,21 @@ class Results:
         passed = sum(1 for r in self.items if r["status"] == "PASS")
         print(f"\n{passed} passed, {len(fails)} failed -> {path}", flush=True)
         return 1 if fails else 0
+
+
+def body_of(res) -> dict:
+    """Result of an MCP tool call as a dict; a tool error becomes {'_error': {...}} (code, message, uncertain_state, detail)."""
+    import re
+    if res.is_error:
+        m = re.search(r"\{.*\}", res.content[0].text, re.S)
+        try:
+            return {"_error": json.loads(m.group(0))} if m else {"_error": {"code": "?", "message": res.content[0].text}}
+        except ValueError:
+            return {"_error": {"code": "?", "message": res.content[0].text}}
+    if res.structured_content is not None:
+        return res.structured_content
+    return json.loads(res.content[0].text)
+
+
+def code_of(b: dict) -> str | None:
+    return (b.get("_error") or {}).get("code")

@@ -49,7 +49,7 @@ async def main() -> int:
                 tools = await s.list_tools()
                 names = sorted(t.name for t in tools.tools)
                 check("MCP initialize + list_tools", names == sorted(["session_info", "read_memory", "read_registers", "capture_breakpoint",
-                      "experiment_status", "cancel_experiment", "execution_control"]), tools=names)
+                      "experiment_status", "cancel_experiment", "execution_control", "start_session", "stop_session"]), tools=names)
                 check("no arbitrary lua/shell/debugger-command tool exposed",
                       not any(k in n for n in names for k in ("lua", "shell", "exec_", "command", "eval")))
 

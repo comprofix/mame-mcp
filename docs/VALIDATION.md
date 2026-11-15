@@ -282,6 +282,41 @@ Production code and the multi-address behaviour and limits are untouched.
   change PC/SP at the observer, which the PC and SP checks would show).
 * README.md and this file now both give 100 checks for hardening (the earlier 92 and the 91+1 in the closeout are historical results of earlier code).
 
+## 9. Managed sessions: `start_session` / `stop_session` (`mcp_session_e2e.py`, `tests/test_session.py`): PASSED for Shinobi on Windows
+Run through the official MCP SDK client against **one** server process (production entry point, no `MAMEMCP_PORT`, no `launch.json`, no chosen run directory; the server environment deliberately carried `MAMEMCP_TEST_FAIL_CLEAR=1`).
+40 checks, 0 failed (`runs\mcp_session_e2eesults.json`):
+* **A** server initialises with no MAME; `session_info` = `no_session`; bridge tools = `no_session` (an unrelated MAME on its own port is not attached); `stop_session` no-op; bad/unknown system refused before any launch; `start_session` exposes only `system` and `ready_timeout_s`.
+* **B** `start_session(shinobi)` ready in ~1-4 s: machine identity, `debugger_stopped`, unique run/evidence dirs, ROM set verified good; second start refused (`session_active`); test-only hooks not inherited (`test_hooks == []`).
+* **C** stopped-state `session_info`/`read_registers`, `resume`, bounded capture of 30 events at the validated address `0x404`: completed, cleanup verified, evidence files present, execution still running.
+* **D** `stop_session` with a capture still running: capture cancelled and verified, evidence finalised, owned process gone, unrelated MAME untouched; afterwards `no_session` with `last_session`.
+* **E** second start in the same server: new session id and run dir; old experiment ids refused (`experiment_from_other_session`; default status does not inherit).
+* **F** unexpected exit (owned MAME killed from outside during a capture): `exited` with exit code, calls refused as `session_exited` (no reconnect to the dead process), new `start_session` replaces the record.
+* **G** startup failure (second server, corrupt `shinobi.zip`): `mame_exited_during_startup` with exit code, MAME output tail and run dir; state `failed`; unrelated MAME untouched.
+* **H** normal server shutdown (stdin closed) with an active capture: the server's own cleanup ran (capture verified, process terminated) and the MAME was gone.
+
+Unit tests (47 added, fakes only, not MAME evidence): argument validation, production-only launch arguments, start failures (exit during startup, timeout, machine mismatch, test hooks, port squatter, launch exception), ownership refusal
+(wrong image / recycled pid / foreign port owner / unreadable image: never terminated), kill escalation, unexpected exit, serialisation (stop waits for in-flight calls, new calls and starts refused during stop, drain timeout reported), external fallback, shutdown, configuration, launcher env hygiene.
+Regression after the change: `pytest` 97 passed; `validate.py` 51, `mcp_e2e.py` 13, `mcp_restart_e2e.py` 22, `mcp_bank_e2e.py` 8, `mcp_multi_e2e.py` 11, `validate_hardening.py` 100, `validate_banked.py` 42, `validate_multi.py` 67, `validate_latency.py` 10, all 0 failed.
+(One run of `validate.py` failed its two short-timeout checks once, passed on rerun: timing-sensitive; and the first restart run exposed that external-mode `session_info` swallowed `session_changed`, fixed.)
+
+**Limitations / untested:** a forced kill of the MCP server (no cleanup, MAME may be left running); the MCP SDK client's own shutdown kills the process tree after 2 s, so the graceful path is verified by the server's stderr line, not by timing alone; only Shinobi and Windows; free-port selection has a small race
+(a squatter on the chosen port is detected by the bridge-port ownership check and fails the start); a hung MAME is stopped after the 20 s drain/timeouts, not instantly; `-verifyroms` failure does not by itself block a start (MAME's own error shows as startup failure).
+Live Claude Code tool use of these tools is a separate step (see README / hand-over); its first result is recorded in 9a below.
+
+### 9a. Live Claude Code smoke test (2026-11-15): PASSED, live-client validation (separate from the harness results above)
+Evidence class: Claude Code (Sonnet 5.5) called the registered `mame` MCP tools directly (no shell, no harness script) against the real MAME 0.289 and Shinobi romset. The harness sections above (`mcp_session_e2e.py` and the others) drive the server with the official MCP SDK client; this is the first run through Claude Code itself. It is one run, not a repeatable script, and the outputs below are as the tools reported them.
+* `session_info` = `no_session`; `start_session(shinobi)` ready (pid 53960, run `shinobi-20261115-141611-8111a3`), `debugger_stopped`, `test_hooks == []`, `unresolved_instrumentation == []`, `-verifyroms` good.
+* Stopped `:maincpu` registers: PC `0x402`, SP `0xFFFFFF00`, SR `0x2700`.
+* `capture_breakpoint` at `:maincpu` `0x404` (30 events, 15 s, D0 and SR), then `resume`; the first `experiment_status` poll already showed `completed`: 30 captured, 30 observed, 0 dropped, reason `event_limit`, 2227 ms wall, cleanup verified (breakpoint cleared, temporaries reset). Last five events: D0 `0x0`, SR `0x2404` at pc `0x404`. Evidence: `runs\sessions\shinobi-20261115-141611-8111a3\evidence\exp-s1794716171-9253df-001\` (`manifest.json`, `events.jsonl`).
+* `stop_session`: process identity verified, terminated, no cleanup failures; `session_info` afterwards `no_session` with `last_session.state == exited`, `exit_reason == stopped_by_stop_session`, `exit_code == 1`.
+* Not covered by this run: any machine other than Shinobi, error paths, stop with a capture active, or repeated use from the live client.
+
+**Why `exit_code` is 1 after `stop_session` (source inspection plus one focused check):**
+* `Sessions._terminate` (`session.py`) first calls `proc.poll()`; only if MAME is still running and its identity is verified does it call `proc.terminate()`, then reads `proc.poll()` into `exit_code`. The reply also had `was_running: true`, no `escalated_to_kill` and `still_running: false`, so the graceful `terminate()` path was the one taken.
+* On Windows, CPython's `Popen.terminate()` is `_winapi.TerminateProcess(handle, 1)` (shown by `inspect.getsource` on Python 3.14.7). A throwaway Python child terminated that way returned `returncode == 1`. `Popen.kill()` is an alias on Windows, so the escalation path would give 1 as well.
+* Conclusion: the code 1 is supplied by our termination mechanism. It is not an emulator-reported status and does not by itself indicate an emulator failure. No production change was made; none was warranted.
+* **Remaining uncertainty:** the exit code cannot distinguish "MAME was terminated by us" from "MAME exited by itself with 1" at the moment of stopping. The distinguishing evidence is `was_running: true` together with the identity check in the same `stop_session` reply and the `stopped_by_stop_session` reason that this code path sets. I did not run MAME with a clean exit (for example its own quit) to see what code it returns, and I did not inspect MAME's stderr for this run. Consumers should treat `exit_code` as meaningful only for `unexpected_exit` and `startup_failed`, not for `stopped_by_stop_session` or `server_shutdown`.
+
 ## Failed during development (found by validation, fixed)
 Original POC: `bpset(addr)` without condition/action crashes MAME 0.289; expressions are hex by default (`#` for decimal);
 counter reset needs a bare `temp9=0`; the single-accept socket needs `goodbye` + heartbeat re-arm; a debugger stop also sets

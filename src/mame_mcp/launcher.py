@@ -120,7 +120,7 @@ def launch(*, system: str = "shinobi", port: int = 9411, run_dir: Path | None = 
         (run_dir / "launch.json").write_text(json.dumps(info, indent=2))
     # TEST-ONLY fault-injection hooks (MAMEMCP_TEST_*) are never inherited from the ambient environment: they exist in the
     # MAME process only when a test passes them explicitly through `test_env`, and the launch record says so.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("MAMEMCP_TEST_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MAMEMCP_TEST_") and k != "MAMEMCP_FIXTURE_DIR"}
     env.update(MAMEMCP_PORT=str(port), MAMEMCP_EVIDENCE_DIR=_fwd(evidence))
     for k, v in (test_env or {}).items():
         if not k.startswith("MAMEMCP_TEST_"):
@@ -132,9 +132,11 @@ def launch(*, system: str = "shinobi", port: int = 9411, run_dir: Path | None = 
         fx_dir.mkdir(exist_ok=True)
         env["MAMEMCP_FIXTURE_DIR"] = _fwd(fx_dir)
         info["fixture_dir"] = str(fx_dir)
-    log = open(run_dir / "mame_stdout.txt", "w")
     # cwd = run_dir/home so any stray relative-path output (e.g. -debuglog debug.log) stays isolated.
-    proc = subprocess.Popen(cmd, cwd=run_dir / "home", env=env, stdout=log, stderr=subprocess.STDOUT)
+    # stdin is detached: when started by an MCP server, the inherited stdin would be the MCP protocol pipe.
+    with open(run_dir / "mame_stdout.txt", "w") as log:  # the child keeps its own inherited handle
+        proc = subprocess.Popen(cmd, cwd=run_dir / "home", env=env, stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=subprocess.STDOUT)
     info["pid"] = proc.pid
     try:  # (pid, creation time) identifies this process instance; a recycled pid will not match (see winwake)
         from . import winwake

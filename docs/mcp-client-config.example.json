@@ -1,6 +1,18 @@
 {
+  "_comment": "Everyday setup: ONE entry, no MAME, PID, launch.json or run directory needed. Register with: claude mcp add mame --scope user -e \"MAMEMCP_MAME_DIR=D:\\arcade\\mame\" -e \"MAMEMCP_ROMPATH=D:\\arcade\\ROMs\\MAME 0.289 ROMs (merged)\" -- <repo>\\.venv\\Scripts\\python.exe -I -m mame_mcp.server . The game is started later, explicitly, with the start_session tool. Optional: MAMEMCP_RUNS_DIR. This file is a reference, nothing reads it.",
   "mcpServers": {
     "mame": {
+      "type": "stdio",
+      "command": "C:\\Users\\MatthewMcKinnon\\git\\mame-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-I", "-m", "mame_mcp.server"],
+      "env": {
+        "MAMEMCP_MAME_DIR": "D:\\arcade\\mame",
+        "MAMEMCP_ROMPATH": "D:\\arcade\\ROMs\\MAME 0.289 ROMs (merged)"
+      }
+    }
+  },
+  "_external_attachment_example (advanced, optional; NOT the everyday setup)": {
+    "mame-external": {
       "type": "stdio",
       "command": "C:\\Users\\MatthewMcKinnon\\git\\mame-mcp\\.venv\\Scripts\\python.exe",
       "args": ["-I", "-m", "mame_mcp.server"],
