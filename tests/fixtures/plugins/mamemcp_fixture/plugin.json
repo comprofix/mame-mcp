@@ -1,0 +1,10 @@
+{
+  "plugin": {
+    "name": "mamemcp_fixture",
+    "description": "TEST-ONLY fixture: emulates user actions and independent observation for mame-mcp validation. Never loaded by the server.",
+    "version": "0.1.0",
+    "author": "mame-mcp POC",
+    "type": "plugin",
+    "start": "false"
+  }
+}

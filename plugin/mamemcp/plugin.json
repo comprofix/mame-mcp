@@ -1,0 +1,10 @@
+{
+  "plugin": {
+    "name": "mamemcp",
+    "description": "Local MAME bridge for the mame-mcp proof of concept",
+    "version": "0.1.0",
+    "author": "mame-mcp POC",
+    "type": "plugin",
+    "start": "false"
+  }
+}

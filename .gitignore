@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Generated validation/research output (scripts write to runs\<suite>\ and runs\<timestamp>\)
+runs/
+
+# Logs and scratch
+*.log
+*.tmp
+scratch/
+tmp/
+
+# MAME-generated state (launcher uses a per-run home dir; these guard against a MAME run from the repo root)
+/cfg/
+/nvram/
+/sta/
+/snap/
+/diff/
+/comments/
+/inp/
+/ini/
+/hash/
+/memcard/
+/dwarf/
+*.sta
+*.inp
+*.avi
+*.mng
+*.wav
+mame.ini
+debug.log
+error.log
+
+# ROMs, disk images and downloaded binaries (never part of the repo)
+*.chd
+*.rom
+*.7z
+*.exe
+*.dll
+/roms/
+/mame/
+/samples/
+/artwork/
+/downloads/
+
+# Local session metadata and machine-specific config
+launch.json
+*.pid
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+secrets*
+*.local.json
+.claude/settings.local.json

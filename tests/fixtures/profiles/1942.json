@@ -1,0 +1,119 @@
+{
+  "_comment": "Banked-memory validation target (MAME 0.289, set '1942' = 1942 (Revision B)). Test fixture data only: the server contains none of this.",
+  "system": "1942",
+  "description": "1942 (Revision B), Capcom 1984",
+  "rom_zip": {
+    "file": "1942.zip",
+    "sha1": "20231872c77657a9b327877a046197b0dd59adf5",
+    "note": "merged set from the local MAME 0.289 ROM collection; read only; -verifyroms 1942 reports good"
+  },
+  "source": {
+    "file": "src/mame/capcom/1942.cpp (tag mame0289, fetched from the mamedev/mame repository, source only)",
+    "address_map": "_1942_state::_1942_map: map(0x0000,0x7fff).rom(); map(0x8000,0xbfff).bankr(\"bank1\"); map(0xc806,0xc806).w(bankswitch_w)",
+    "select": "_1942_state::bankswitch_w: membank(\"bank1\")->set_entry(data & 0x03)",
+    "entries": "driver_init: membank(\"bank1\")->configure_entries(0, 4, &ROM[0x10000], 0x4000) over region ':maincpu' (size 0x20000, ROMREGION_ERASEFF)",
+    "register_note": "0xC806 is write-only (no read handler); the selected entry is observable only through bank.entry (Lua) or by reading the window",
+    "rom_start_line": 691
+  },
+  "maincpu": {
+    "tag": ":maincpu",
+    "cpu": "Z80",
+    "space": "program",
+    "window": {
+      "start": "0x8000",
+      "end": "0xBFFF"
+    },
+    "select_register": "0xC806",
+    "select_mask": "0x03",
+    "bank_tag": ":bank1",
+    "entries": 4,
+    "frame_handler_pc": "0x11",
+    "frame_handler_next_pc": "0x12",
+    "frame_handler_note": "RST 10h vector at 0x10: PUSH HL(0x10);PUSH DE(0x11);PUSH BC(0x12);PUSH AF(0x13);JP 0196h. Entered about once per frame during attract mode. Captures use 0x11 and an independent observer 0x12. A Lua-requested debugger stop lands at 0x10 (12/12 tries), and MAME does not re-trigger a breakpoint at the PC it resumes from, so a capture at 0x10 would miss that first instance.",
+    "natural_select": {
+      "pc": "0x119F",
+      "value": "0x00",
+      "note": "the game's own write to 0xC806 after reset; observed by watchpoint. Only value 0 was observed in attract mode and in about 60 s after a coin/start input (not shown to be real gameplay); non-zero entries were reached by harness interventions"
+    },
+    "attract_mode_pc_note": "300 PC samples all fell in 0x0000-0x0FFF (frame-wait loop near 0x91-0x9A): the window is not executed, so a changed bank is safe while it is held",
+    "unequal_rates": {
+      "note": "Z80 :maincpu. hot = per-frame RST 10h handler (about 60/s); rare = instruction after 'ld (hl),1' at 0x2BA0 (selects bank entry 1, from docs/research_1942_banks.md; observed a few times per several seconds in attract mode). Observers sit at the next instruction boundary of each.",
+      "hot": {
+        "address": "0x11",
+        "observer_address": "0x12"
+      },
+      "rare": {
+        "address": "0x2BA2",
+        "observer_address": "0x2BA5",
+        "opcode_at_address": "DD 56 00 (ld d,(ix+0)), 3 bytes"
+      }
+    }
+  },
+  "audiocpu": {
+    "tag": ":audiocpu",
+    "cpu": "Z80",
+    "note": "its 0x8000-0x87FF is RAM, not the banked window"
+  },
+  "backing_region": {
+    "region": ":maincpu",
+    "base_offset": "0x10000",
+    "entry_size": "0x4000",
+    "entry_offset_rule": "0x10000 + 0x4000 * entry (from configure_entries; established by source and by the byte comparison in the validation)",
+    "rom_files_in_region": [
+      {
+        "name": "srb-03.m3",
+        "offset": "0x00000",
+        "size": "0x4000",
+        "sha1": "a089a9bc55fb7d6d0ac53f91b258396d5d62677a"
+      },
+      {
+        "name": "srb-04.m4",
+        "offset": "0x04000",
+        "size": "0x4000",
+        "sha1": "856fbb302c9a4ec7850a26ab23dab8467f79bba4"
+      },
+      {
+        "name": "srb-05.m5",
+        "offset": "0x10000",
+        "size": "0x4000",
+        "sha1": "35ba1d82bd901940f61d8619273463d02fc0a952"
+      },
+      {
+        "name": "srb-06.m6",
+        "offset": "0x14000",
+        "size": "0x2000",
+        "sha1": "2ccc8fc59962d3001fbc10e8d2f20a254a74f251"
+      },
+      {
+        "name": "srb-07.m7",
+        "offset": "0x18000",
+        "size": "0x4000",
+        "sha1": "b588eaf6fddd66ecb2d9832dc197f286f1ccd846"
+      }
+    ]
+  },
+  "entries_expected": {
+    "0": {
+      "file": "srb-05.m5",
+      "populated": "0x4000",
+      "first8": "84b08431857685d3"
+    },
+    "1": {
+      "file": "srb-06.m6",
+      "populated": "0x2000",
+      "first8": "60800a81c4817e82",
+      "note": "only the first 0x2000 bytes come from a ROM file; the rest of the 0x4000 entry is the region's 0xFF erase fill"
+    },
+    "2": {
+      "file": "srb-07.m7",
+      "populated": "0x4000",
+      "first8": "dc98ba85c088dc98"
+    },
+    "3": {
+      "file": null,
+      "populated": "0x0",
+      "first8": "ffffffffffffffff",
+      "note": "entry 3 maps region offset 0x1C000 which has no ROM file: 0xFF erase fill"
+    }
+  }
+}

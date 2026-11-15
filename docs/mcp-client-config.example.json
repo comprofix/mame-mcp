@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mame": {
+      "type": "stdio",
+      "command": "C:\\Users\\MatthewMcKinnon\\git\\mame-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-I", "-m", "mame_mcp.server"],
+      "env": {
+        "MAMEMCP_PORT": "9411",
+        "MAMEMCP_LAUNCH_INFO": "C:\\Users\\MatthewMcKinnon\\git\\mame-mcp\\runs\\<run-dir>\\launch.json"
+      }
+    }
+  }
+}

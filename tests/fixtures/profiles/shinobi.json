@@ -1,0 +1,121 @@
+{
+  "_comment": "Game/CPU-specific addresses for mame-mcp validation (Shinobi, MAME 0.289). Test fixture data only: the server contains none of these.",
+  "system": "shinobi",
+  "maincpu": {
+    "tag": ":maincpu",
+    "cpu": "68000",
+    "handler_pc": "0x404",
+    "handler_note": "68000 level-4 autovector target; hit about every frame (vector table 0x70)",
+    "manual_stop_pc": "0x286C",
+    "never_hit_pc": "0xA0000",
+    "registers": [
+      "CURPC",
+      "D0",
+      "D1",
+      "A0",
+      "A1",
+      "SP",
+      "SR"
+    ],
+    "stack_register": "SP",
+    "address_mask": "0xFFFFFF",
+    "multi_location": {
+      "note": "68000 level-4 handler path (disassembled with MAME's own dasm): 0x404 bra $286C; 0x286C movem.l; 0x2870 tst.b $F01E.w; 0x2874 bne. Every interrupt executes all of them, so a location at 0x404 / 0x2870 has an independent MAME-debugger observer at the neighbouring instruction (0x286C / 0x2874).",
+      "locations": [
+        {
+          "id": "irq4",
+          "address": "0x404",
+          "observer_address": "0x286C",
+          "observer_state_identical": [
+            "D0",
+            "D1",
+            "A0",
+            "A1",
+            "SP",
+            "SR"
+          ]
+        },
+        {
+          "id": "body",
+          "address": "0x2870",
+          "observer_address": "0x2874",
+          "observer_state_identical": [
+            "D0",
+            "D1",
+            "A0",
+            "A1",
+            "SP"
+          ],
+          "observer_sr_note": "tst.b between them changes the condition codes, so SR is not compared"
+        }
+      ],
+      "registers": [
+        "D0",
+        "D1",
+        "A0",
+        "A1",
+        "SP",
+        "SR"
+      ]
+    }
+  },
+  "soundcpu": {
+    "tag": ":soundcpu",
+    "cpu": "Z80",
+    "hot_pc": "0xAE6",
+    "hot_note": "idle loop 0xAE4..0xAEA, found by sampling PC 120 times on this ROM set (scripts note: runs/zprobe)",
+    "loop_range": [
+      "0xAE4",
+      "0xAEA"
+    ],
+    "registers": [
+      "PC",
+      "SP",
+      "A",
+      "BC",
+      "HL",
+      "AF"
+    ],
+    "capture_registers": [
+      "PC",
+      "SP",
+      "BC",
+      "HL"
+    ],
+    "debugger_symbols": {
+      "PC": "pc",
+      "SP": "sp",
+      "A": "a",
+      "BC": "bc",
+      "HL": "hl",
+      "AF": "af"
+    },
+    "observer_pc": "0xAE8",
+    "hit_instruction_bytes": "cb47",
+    "observer_preserved_registers": [
+      "SP",
+      "BC",
+      "HL"
+    ],
+    "observer_hit_counts": [
+      5,
+      40,
+      150
+    ],
+    "observer_event_limit": 400,
+    "observer_note": "idle loop 0xAE4 in a,(1) / 0xAE6 bit 0,a (CB 47) / 0xAE8 jr z,0xAE4 (bytes read from ROM). The observer breakpoint sits on 0xAE8, the instruction after the capture address; bit 0,a only writes F, so SP/BC/HL read at the observer equal their values at the hit.",
+    "never_hit_pc": "0x7000",
+    "address_mask": "0xFFFF"
+  },
+  "explicit_cpu_qualification": {
+    "address": "0x0",
+    "note": "program byte 0 differs between the CPUs (68000 vector table vs Z80 reset code); the test compares bridge output to MAME's own debugger per CPU and requires the two CPUs to differ"
+  },
+  "read_tap": {
+    "cpu": ":maincpu",
+    "space": "program",
+    "start": "0x8",
+    "end": "0xB",
+    "note": "68000 vector-table entry (bus-error/address-error vectors): ROM, not read by normal execution, so tap calls come only from the test's reads"
+  }
+}
