@@ -11,7 +11,8 @@ States (``session.state`` in session_info): no_session, starting, ready, stoppin
 
 Concurrency: bridge calls (captures, reads, execution control) register as in-flight; start/stop change the state
 under one condition variable, so a lifecycle change never interleaves with a call that is already running, and
-calls made during a lifecycle change are refused rather than queued.
+calls made during a lifecycle change are refused rather than queued. State-changing operations (checkpoints, input
+presses/releases, RAM writes; operations.py) additionally run one at a time under `exclusive()`.
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ from typing import Any, Callable, Iterator
 
 from . import launcher, winwake
 from .bridge import BridgeClient
+from .operations import StateOperations
 from .protocol import BridgeError
 
 NO_SESSION, STARTING, READY, STOPPING, EXITED, FAILED = "no_session", "starting", "ready", "stopping", "exited", "failed"
@@ -126,6 +128,9 @@ class Session:
     exit_reason: str | None = None
     failure: dict[str, Any] | None = None
     stop_report: dict[str, Any] | None = None
+    mame_version: str | None = None
+    checkpoints: dict[str, dict[str, Any]] = field(default_factory=dict)  # id -> metadata (operations.py)
+    checkpoint_seq: int = 0
 
     def summary(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -133,6 +138,7 @@ class Session:
             "session_id": self.session_id, "pid": self.pid, "port": self.port,
             "run_dir": str(self.run_dir), "evidence_dir": str(self.evidence_dir),
             "started_utc": self.started_utc, "ready_utc": self.ready_utc, "ended_utc": self.ended_utc,
+            "checkpoints": sorted(self.checkpoints),
         }
         if self.state in (EXITED, FAILED) or self.exit_code is not None:
             d["exit_code"], d["exit_reason"] = self.exit_code, self.exit_reason
@@ -143,7 +149,7 @@ class Session:
         return d
 
 
-class SessionManager:
+class SessionManager(StateOperations):
     def __init__(self, cfg: SessionConfig, *, launch_fn: Callable[..., Any] = launcher.launch,
                  client_factory: Callable[[int, int, int | None], BridgeClient] = _default_client,
                  identity: ProcessIdentity | None = None, port_picker: Callable[[], int] = _free_port):
@@ -156,6 +162,7 @@ class SessionManager:
         self._last: dict[str, Any] | None = None
         self._inflight = 0
         self._shutting_down = False
+        self._init_operations()
 
     # ------------------------------------------------------------------ introspection
     def snapshot(self, settle: float = 0.0) -> dict[str, Any]:
@@ -210,9 +217,7 @@ class SessionManager:
 
     # ------------------------------------------------------------------ routing for bridge tools
     @contextlib.contextmanager
-    def use_client(self, external: BridgeClient | None = None) -> Iterator[tuple[BridgeClient, bool]]:
-        """Yield (client, managed) for one bridge call, or raise a coded BridgeError. A managed call counts as
-        in-flight so stop_session can wait for it; calls during starting/stopping are refused."""
+    def _use(self, external: BridgeClient | None) -> Iterator[tuple[BridgeClient, bool, Session | None]]:
         with self._cond:
             self._refresh_locked()
             s = self._current
@@ -236,12 +241,27 @@ class SessionManager:
                 raise BridgeError("session_failed", "the last start_session failed; see session_info.failure, "
                                   "then call start_session again", detail=s.failure)
         try:
-            yield client, managed
+            yield client, managed, (s if managed else None)
         finally:
             if managed:
                 with self._cond:
                     self._inflight -= 1
                     self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def use_client(self, external: BridgeClient | None = None) -> Iterator[tuple[BridgeClient, bool]]:
+        """Yield (client, managed) for one bridge call, or raise a coded BridgeError. A managed call counts as
+        in-flight so stop_session can wait for it; calls during starting/stopping are refused."""
+        with self._use(external) as (client, managed, _s):
+            yield client, managed
+
+    @contextlib.contextmanager
+    def use_managed(self) -> Iterator[tuple[BridgeClient, Session]]:
+        """Like use_client for the operations that exist only for a session this server owns (checkpoints, input
+        presses, RAM writes): an external attachment is never used, so it has nothing to clean up after."""
+        with self._use(None) as (client, _managed, s):
+            assert s is not None
+            yield client, s
 
     # ------------------------------------------------------------------ start
     def _find_rompath(self, system: str) -> Path:
@@ -324,6 +344,7 @@ class SessionManager:
                 raise BridgeError("shutting_down", "start was interrupted")
             s.state, s.ready_utc = READY, _utc()
             s.session_id = s.client.session_id
+            s.mame_version = bridge_info.get("mame_version")
             self._cond.notify_all()
         m = bridge_info["machine"]
         return {
@@ -387,17 +408,21 @@ class SessionManager:
 
     def _teardown(self, s: Session, prior: str, drained: bool, *, cancel_timeout: float) -> dict[str, Any]:
         failures: list[str] = []
-        report: dict[str, Any] = {"drained_in_flight_calls": drained, "capture_cleanup": None, "process": None,
-                                  "cleanup_failures": failures}
+        report: dict[str, Any] = {"drained_in_flight_calls": drained, "input_cleanup": None, "capture_cleanup": None,
+                                  "process": None, "cleanup_failures": failures}
         if not drained:
             failures.append("in-flight bridge calls did not finish before the stop; continuing (they fail when MAME is stopped)")
         if prior == READY and s.client is not None and s.proc is not None and s.proc.poll() is None:
+            inp = self._release_inputs(s.client, cancel_timeout)
+            report["input_cleanup"] = inp
+            if not inp.get("released"):
+                failures.append("held inputs were not confirmed released; stopping MAME releases them regardless")
             cap = self._cancel_active_capture(s.client, cancel_timeout)
             report["capture_cleanup"] = cap
             if not cap.get("verified"):
                 failures.append("capture cleanup was not verified; stopping MAME discards its breakpoints regardless")
         elif prior == READY:
-            report["capture_cleanup"] = {"skipped": "MAME was not running"}
+            report["input_cleanup"] = report["capture_cleanup"] = {"skipped": "MAME was not running"}
         if s.client is not None:
             s.client.close(graceful=False)
         if s.proc is not None:

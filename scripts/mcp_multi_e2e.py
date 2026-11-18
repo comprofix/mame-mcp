@@ -58,8 +58,8 @@ async def main() -> int:
                 await s.initialize()
                 tools = {t.name: t for t in (await s.list_tools()).tools}
                 props = tools["capture_breakpoint"].input_schema["properties"]
-                check("MCP: capture_breakpoint advertises `locations` and still `address`; no input/watchpoint/command tool added",
-                      "locations" in props and "address" in props and not any(k in n for n in tools for k in ("input", "watch", "command", "eval", "lua", "write")), tools=sorted(tools))
+                check("MCP: capture_breakpoint advertises `locations` and still `address`; no watchpoint/command/eval/lua tool (the typed input/checkpoint/write_memory tools are the later, separately validated milestone)",
+                      "locations" in props and "address" in props and not any(k in n for n in tools for k in ("watch", "command", "eval", "lua")), tools=sorted(tools))
                 await s.call_tool("execution_control", {"action": "resume"})
                 await asyncio.sleep(4)
                 base = {"cpu": ":maincpu", "max_events": 20, "max_wall_seconds": 20, "registers": ["PC", "HL"], "memory": [{"address": 0, "size": 1}]}

@@ -34,6 +34,15 @@ local LIMITS = {
 	max_history = 20,
 	max_status_events = 5,
 	console_scan_cap = 20000,
+	max_input_fields = 8,        -- digital fields held together by one press
+	max_input_frames = 600,          -- emulated frames one press may be held (10 s at 60 Hz)
+	input_latency_frames = 3,        -- frames after arming that may read idle before the hold is counted regardless
+	max_listed_fields = 600,
+	max_write_bytes = 4,         -- write_memory width: 1, 2 or 4 bytes
+	checkpoint_timeout_ms = 10000,   -- host time allowed for a deferred (scheduled) save/load to complete
+	checkpoint_window_frames = 6,    -- deferred load: emulated frames past the checkpoint frame still accepted as "restored"
+	max_digest_bytes = 262144,       -- RAM (memory shares) hashed into a checkpoint fingerprint; beyond this the digest is marked partial
+	checkpoint_max_frames = 90,      -- a deferred operation may let emulation run at most this many frames (MAME gives up after 1 s)
 }
 
 local function env(name, default)
@@ -52,6 +61,12 @@ function exports.startplugin()
 		-- TEST-ONLY fault injection: the bridge's own bpclear of the Nth location (1-based) of any experiment is suppressed
 		-- and reported as failed, so the breakpoint really stays installed in MAME. Unset in normal use.
 		test_fail_clear = tonumber(os.getenv("MAMEMCP_TEST_FAIL_CLEAR") or ""),
+		-- MAME's state directory for this run (set by the managed launcher together with -state_directory). Checkpoint
+		-- files are <state_dir>/<system>/<id>.sta; without it checkpoints are unavailable.
+		state_dir = env("MAMEMCP_STATE_DIR", nil),
+		-- TEST-ONLY: skip the immediate (debugger statesave/stateload) attempt so the scheduled/deferred completion path is
+		-- exercised on a real MAME. Unset in normal use.
+		test_force_scheduled_checkpoint = os.getenv("MAMEMCP_TEST_FORCE_SCHEDULED_CHECKPOINT") == "1",
 	}
 
 	local ticks_per_s = emu.osd_ticks_per_second()
@@ -84,7 +99,16 @@ function exports.startplugin()
 	local last_heartbeat_ms = 0
 	local reopen_after_flush = false
 	local reconnects = 0
+	-- Forward declarations: held inputs are released whenever the client goes away (defined with the input operations).
+	local epoch = 0            -- bumped by every verified checkpoint load; older experiment ids are stale afterwards
+	local input_active = nil   -- the one held-input group (see "inputs" below)
+	local input_last = nil     -- summary of the most recent finished group
+	local input_counter = 0
+	local ckpt_pending = nil   -- unfinished checkpoint operation (scheduled fallback; see "checkpoints" below)
+	local ckpt_last = nil      -- result of the most recent finished one
+	local release_inputs, input_summary, ckpt_summary
 	local function reopen_socket(reason)
+		if release_inputs then pcall(release_inputs, "client_disconnected: " .. reason) end
 		pcall(function() sock:close() end)
 		inbuf, outbuf = "", ""
 		client_seen, write_failures, reopen_after_flush = false, 0, false
@@ -300,15 +324,21 @@ function exports.startplugin()
 				debugger_available = machine().debugger ~= nil,
 				limits = LIMITS,
 				operations = { "session_info", "read_memory", "read_registers", "capture_breakpoint",
-					"experiment_status", "cancel_experiment", "execution_control", "goodbye" },
+					"experiment_status", "cancel_experiment", "execution_control", "goodbye",
+					"list_inputs", "input_press", "input_status", "input_cancel", "write_memory",
+					"checkpoint_save", "checkpoint_load", "checkpoint_status" },
 				capture_scope = "breakpoints on the program space of the named cpu; registers are read in the breakpoint condition (that cpu's own symbol table); memory fields use explicitly device-qualified, side-effect-suppressed debugger operators (tag.pb@ etc.). Verified on :maincpu (68000) and :soundcpu (Z80) of shinobi only.",
 			},
 			active_experiment = active and active.id or nil,
 			unresolved_instrumentation = orphan_rows(),
+			state_epoch = epoch,
+			input = input_summary and input_summary() or nil,
+			checkpoint = ckpt_summary and ckpt_summary() or nil,
 			test_hooks = (function()
 				local t = {}
 				if cfg.test_fail_install_at then t[#t + 1] = "MAMEMCP_TEST_FAIL_INSTALL_AT=" .. cfg.test_fail_install_at end
 				if cfg.test_fail_clear then t[#t + 1] = "MAMEMCP_TEST_FAIL_CLEAR=" .. cfg.test_fail_clear end
+				if cfg.test_force_scheduled_checkpoint then t[#t + 1] = "MAMEMCP_TEST_FORCE_SCHEDULED_CHECKPOINT=1" end
 				return t
 			end)(),
 			counters = { periodic_calls = counters.periodic, requests = counters.requests, errors = counters.errors, socket_reopens = reconnects },
@@ -980,7 +1010,7 @@ function exports.startplugin()
 		end
 
 		local exp = {
-			id = id, tag = tag, cpu = args.cpu, locs = p.locs, loc_by_id = loc_by_id, multi = p.multi, max_events = p.max_events, max_wall = p.max_wall,
+			id = id, epoch = epoch, tag = tag, cpu = args.cpu, locs = p.locs, loc_by_id = loc_by_id, multi = p.multi, max_events = p.max_events, max_wall = p.max_wall,
 			regs = p.regs, mems = p.mems, label = p.label, temps = temps,
 			state = "running", started_host_ms = host_ms(), last_seq = 0, captured = 0, dropped = 0,
 			cl_n = -1, cl_last = nil, errors = {}, evidence_errors = {}, recent = {}, transitions = {},
@@ -1156,13 +1186,29 @@ function exports.startplugin()
 		return fail("unknown_experiment", "no experiment " .. tostring(id))
 	end
 
+	-- An experiment from before a checkpoint load describes a timeline that no longer exists: refuse its id (its evidence
+	-- files stay on disk) rather than present it as current.
+	local function fail_stale_experiment(exp)
+		return fail("experiment_stale_after_load", string.format(
+			"experiment %s was recorded before a checkpoint load (state epoch %d, now %d); the emulated state it describes was replaced. Its evidence files remain at %s; start a new capture",
+			exp.id, exp.epoch, epoch, exp.dir), { experiment_id = exp.id, experiment_epoch = exp.epoch, current_epoch = epoch, evidence_dir = exp.dir })
+	end
+
 	function ops.experiment_status(args)
 		local id = args.experiment_id
 		if id == nil and active then id = active.id end
-		if id == nil and #order > 0 then id = order[#order] end
-		if id == nil then return fail("unknown_experiment", "no experiments in this session") end
+		if id == nil then
+			for i = #order, 1, -1 do   -- default: the latest experiment of the CURRENT timeline
+				local e = experiments[order[i]]
+				if e and e.epoch == epoch then id = e.id break end
+			end
+		end
+		if id == nil then
+			return fail("unknown_experiment", epoch > 0 and "no experiments since the last checkpoint load" or "no experiments in this session")
+		end
 		local exp = experiments[id]
 		if not exp then return fail_unknown_experiment(id) end
+		if exp.epoch ~= epoch then return fail_stale_experiment(exp) end
 		if exp.state == "running" then pcall(exp.harvest, exp) end
 		return exp_status(exp)
 	end
@@ -1170,6 +1216,7 @@ function exports.startplugin()
 	function ops.cancel_experiment(args)
 		local exp = experiments[args.experiment_id]
 		if not exp then return fail_unknown_experiment(args.experiment_id) end
+		if exp.epoch ~= epoch then return fail_stale_experiment(exp) end
 		if exp.state ~= "running" then
 			local s = exp_status(exp)
 			s.already_finished = true
@@ -1177,6 +1224,723 @@ function exports.startplugin()
 		end
 		finalize(exp, "cancelled")
 		return exp_status(exp)
+	end
+
+	---------------------------------------------------------------------------
+	-- shared guards for operations that change the emulated machine
+	---------------------------------------------------------------------------
+	local function frame_now()
+		local c = emu_clock()
+		return c.frame
+	end
+
+	local function opt(fn)  -- value of fn(), or nil if it raises
+		local ok, v = pcall(fn)
+		if ok then return v end
+		return nil
+	end
+
+	local function execution_stopped()
+		local s = exec_state().state
+		return s == "debugger_stopped" or s == "paused"
+	end
+
+	-- No capture may be running and no instrumentation may be unresolved: a state change under a live breakpoint
+	-- experiment would corrupt its evidence, and unresolved instrumentation means the debugger state is not trusted.
+	local function instrumentation_guard(what)
+		if active then
+			return fail("capture_active", what .. " refused: experiment " .. active.id .. " is still running; cancel it first (cancel_experiment)",
+				{ experiment_id = active.id })
+		end
+		local left = resolve_orphans()
+		if #left > 0 then
+			return fail("unresolved_instrumentation", string.format("%s refused: %d breakpoint(s)/temporary group(s) from an earlier experiment are unresolved. %s", what, #left, RECOVERY),
+				{ remaining_instrumentation = left, recovery = RECOVERY })
+		end
+		return true
+	end
+
+	local function busy_guard(what)
+		if ckpt_pending then
+			return fail("checkpoint_busy", what .. " refused: a checkpoint " .. ckpt_pending.kind .. " (" .. ckpt_pending.id .. ") has not finished; poll checkpoint_status")
+		end
+		if input_active then
+			return fail("input_active", what .. " refused: inputs are being held (" .. input_active.id .. "); release them first (input_cancel)",
+				{ input = input_summary() })
+		end
+		return true
+	end
+
+	---------------------------------------------------------------------------
+	-- inputs: explicit DIGITAL fields held for a bounded number of EMULATED frames
+	---------------------------------------------------------------------------
+	-- Frames are counted from the frame_done notifier, which MAME fires once per emulated frame and not while emulation is
+	-- paused or stopped in the debugger. A press set at frame F is visible to the machine from frame F+1 and is released when
+	-- the Nth frame after arming has completed, so the machine sees it for exactly N frames (verified in
+	-- docs/VALIDATION.md). While emulation is stopped nothing elapses: the press stays held until emulation has run N frames
+	-- or the press is cancelled. The bridge never holds an input without a frame bound, and it releases on cancel, client
+	-- disconnect, machine stop and server stop.
+	local INPUT_CLASSES = { controller = true, misc = true }
+
+	local function sorted_keys(t)
+		local keys = {}
+		for k in pairs(t) do keys[#keys + 1] = k end
+		table.sort(keys)
+		return keys
+	end
+
+	local function port_value(tag)
+		return opt(function() return machine().ioport.ports[tag]:read() end)
+	end
+
+	local function field_info(tag, name, f)
+		local class = opt(function() return f.type_class end)
+		local reason
+		if opt(function() return f.is_analog end) then reason = "analog input: only digital inputs are supported"
+		elseif opt(function() return f.toggle end) then reason = "toggle input: only plain digital inputs are supported"
+		elseif opt(function() return f.enabled end) == false then reason = "field is disabled on this machine"
+		elseif not INPUT_CLASSES[class] then
+			reason = "input class '" .. tostring(class) .. "' is not a controller/misc digital input (DIP switches, machine configuration and other classes are not supported)"
+		end
+		return {
+			port = tag, field = name, class = class, type = opt(function() return f.type end),
+			mask = opt(function() return f.mask end), player = opt(function() return f.player end),
+			digital_joystick = opt(function() return f.is_digital_joystick end), impulse = opt(function() return f.impulse end),
+			supported = reason == nil, unsupported_reason = reason,
+		}
+	end
+
+	function ops.list_inputs(args)
+		local ports = machine().ioport.ports
+		local include_unsupported = args.include_unsupported == true
+		local out, listed, unsupported, truncated, classes = {}, 0, 0, false, {}
+		for _, tag in ipairs(sorted_keys(ports)) do
+			local port = ports[tag]
+			local rows = {}
+			local fields = port.fields
+			for _, name in ipairs(sorted_keys(fields)) do
+				local info = field_info(tag, name, fields[name])
+				classes[tostring(info.class)] = (classes[tostring(info.class)] or 0) + 1
+				if not info.supported then unsupported = unsupported + 1 end
+				if info.supported or include_unsupported then
+					if listed >= LIMITS.max_listed_fields then truncated = true
+					else
+						listed = listed + 1
+						rows[#rows + 1] = info
+					end
+				end
+			end
+			if #rows > 0 then
+				local v = port_value(tag)
+				out[#out + 1] = { tag = tag, value = v and hex(v) or nil, fields = rows }
+			end
+		end
+		return {
+			ports = out, fields_listed = listed, unsupported_fields = unsupported, include_unsupported = include_unsupported,
+			truncated = truncated, field_classes = classes,
+			semantics = "Fields are the machine's own ioport fields as MAME's Lua API exposes them (addressed by port tag + field name). Only digital controller/misc fields are pressable. 'value' is the port's current value as the machine reads it (many ports are active-low).",
+			limits = { max_fields_per_press = LIMITS.max_input_fields, max_frames = LIMITS.max_input_frames },
+			execution = exec_state(), clock = emu_clock(),
+		}
+	end
+
+	local function pressed_now(rec)  -- does any held field's bit differ from the idle baseline sampled before the press?
+		for _, e in ipairs(rec.fields) do
+			local v = port_value(e.port)
+			local base = rec.baseline[e.port]
+			if v and base and e.mask and ((v ~ base) & e.mask) ~= 0 then return true end
+		end
+		return false
+	end
+
+	input_summary = function()
+		local rec = input_active or input_last
+		if not rec then return { state = "none" } end
+		local fields = {}
+		for _, e in ipairs(rec.fields) do fields[#fields + 1] = { port = e.port, field = e.name } end
+		return {
+			state = rec.state, input_id = rec.id, inputs = fields, frames_requested = rec.frames, frames_elapsed = rec.elapsed, latency_frames = rec.latency_frames,
+			armed_at_frame = rec.arm_frame, ended_at_frame = rec.ended_frame, end_reason = rec.end_reason,
+			frames_observed_pressed = rec.observed_frames, release_errors = rec.release_errors,
+			release_verified = rec.release_verified,
+			waiting_for_emulation = (rec.state == "holding" and execution_stopped()) or nil,
+			execution = exec_state(),
+		}
+	end
+
+	release_inputs = function(reason)
+		local rec = input_active
+		if not rec then return nil end
+		local errs = {}
+		for _, e in ipairs(rec.fields) do
+			local ok, err = pcall(function() e.field:set_value(0) end)
+			if not ok then errs[#errs + 1] = e.port .. "/" .. e.name .. ": " .. tostring(err) end
+		end
+		rec.state = (reason == "completed") and "released" or "cancelled"
+		rec.end_reason, rec.release_errors, rec.ended_frame = reason, errs, frame_now()
+		input_last, input_active = rec, nil
+		return rec
+	end
+
+	function ops.input_press(args)
+		if stopping then return fail("machine_stopping", "MAME is shutting down") end
+		if input_active then
+			return fail("input_active", "inputs are already being held (" .. input_active.id .. "); wait for them to finish or call input_cancel", { input = input_summary() })
+		end
+		if ckpt_pending then return fail("checkpoint_busy", "a checkpoint operation is unfinished; poll checkpoint_status") end
+		local raw = args.inputs
+		if type(raw) ~= "table" or #raw < 1 or #raw > LIMITS.max_input_fields then
+			return fail("bad_argument", "inputs must be a list of 1.." .. LIMITS.max_input_fields .. " {port, field} objects")
+		end
+		local frames, ef = parse_uint(args.frames, "frames")
+		if not frames then return nil, ef end
+		if frames < 1 or frames > LIMITS.max_input_frames then
+			return fail("bad_argument", "frames must be 1.." .. LIMITS.max_input_frames .. " (emulated frames)")
+		end
+		local ports = machine().ioport.ports
+		local fields, seen, baseline = {}, {}, {}
+		for i, item in ipairs(raw) do
+			if type(item) ~= "table" or type(item.port) ~= "string" or type(item.field) ~= "string" then
+				return fail("bad_argument", "inputs[" .. (i - 1) .. "] must be an object with string 'port' and 'field'")
+			end
+			local port = ports[item.port]
+			if not port then return fail("unknown_port", "this machine has no input port " .. item.port .. "; call list_inputs") end
+			local f = port.fields[item.field]
+			if not f then
+				return fail("unknown_field", "port " .. item.port .. " has no input field '" .. item.field .. "'; call list_inputs",
+					{ fields = sorted_keys(port.fields) })
+			end
+			local key = item.port .. "\0" .. item.field
+			if seen[key] then return fail("bad_argument", "duplicate input " .. item.port .. "/" .. item.field) end
+			seen[key] = true
+			local info = field_info(item.port, item.field, f)
+			if not info.supported then
+				return fail("unsupported_input", item.port .. "/" .. item.field .. ": " .. info.unsupported_reason, { input = info })
+			end
+			fields[#fields + 1] = { port = item.port, name = item.field, field = f, mask = info.mask }
+			baseline[item.port] = port_value(item.port)
+		end
+		local armed = {}
+		for _, e in ipairs(fields) do
+			local ok, err = pcall(function() e.field:set_value(1) end)
+			if not ok then
+				for _, a in ipairs(armed) do pcall(function() a.field:set_value(0) end) end
+				return fail("input_failed", "could not press " .. e.port .. "/" .. e.name .. ": " .. tostring(err) .. "; everything pressed by this call was released")
+			end
+			armed[#armed + 1] = e
+		end
+		input_counter = input_counter + 1
+		local f0 = frame_now()
+		if not f0 then
+			for _, a in ipairs(armed) do pcall(function() a.field:set_value(0) end) end
+			return fail("unsupported_machine", "this machine has no screen, so emulated frames cannot be counted; inputs are refused")
+		end
+		input_active = {
+			id = string.format("inp-%s-%03d", session_id, input_counter), fields = fields, frames = frames, baseline = baseline,
+			arm_frame = f0, last_frame = f0, elapsed = 0, observed_frames = 0, latency_frames = 0, started = false, state = "holding", release_errors = {},
+		}
+		local s = input_summary()
+		s.semantics = "visible to the machine from the next emulated frame; released after frames_requested emulated frames. Nothing elapses while emulation is paused or stopped in the debugger."
+		return s
+	end
+
+	function ops.input_status(args)
+		return input_summary()
+	end
+
+	function ops.input_cancel(args)
+		local was = input_active ~= nil
+		if was then release_inputs("cancelled") end
+		local s = input_summary()
+		s.was_holding = was
+		return s
+	end
+
+	emu.register_frame_done(function()
+		local f = frame_now()
+		if not f then return end
+		local rec = input_active
+		if rec and f > rec.last_frame then
+			rec.last_frame = f
+			local pressed = pressed_now(rec)
+			if not rec.started and not pressed and rec.latency_frames < LIMITS.input_latency_frames then
+				-- The press was armed mid-frame (typically while stopped): the first frame(s) after the resume can still read
+				-- idle. They do not count, so the machine sees the press for exactly frames_requested frames. Bounded, so a
+				-- field whose effect cannot be observed (shared bit already active) still releases on schedule.
+				rec.latency_frames = rec.latency_frames + 1
+			else
+				rec.started = true
+				rec.elapsed = rec.elapsed + 1
+				if pressed then rec.observed_frames = rec.observed_frames + 1 end
+				if rec.elapsed >= rec.frames then release_inputs("completed") end
+			end
+		end
+		local last = input_last
+		if last and last.release_verified == nil and last.ended_frame and f > last.ended_frame then
+			-- first emulated frame after the release: the machine must read the idle value again
+			last.release_verified = not pressed_now(last)
+		end
+	end)
+
+	---------------------------------------------------------------------------
+	-- write_memory: one explicit RAM write, verified by reading it back
+	---------------------------------------------------------------------------
+	-- The target must resolve to plain RAM in the CPU's address map (MAME's own map description: handler type 'ram' for both
+	-- read and write). ROM, unmapped, I/O, banked, delegate/device handlers and anything else are refused. The map is the
+	-- declared one; a handler installed later at run time is not visible in it, so the read-back is the final arbiter and a
+	-- mismatch is rolled back.
+	local function map_entry_for(sp, a)
+		local ok, entries = pcall(function() return sp.map.entries end)
+		if not ok or entries == nil then return nil, "the address map of this space is not available" end
+		local found
+		for _, e in ipairs(entries) do  -- later entries override earlier ones
+			local base = a & ~(e.address_mirror or 0)
+			if base >= e.address_start and base <= e.address_end then found = e end
+		end
+		return found
+	end
+
+	local function ram_verdict(e)
+		if not e then return "unmapped_target", "no address-map entry covers this address (unmapped)" end
+		local r, w = e.read.handlertype, e.write.handlertype
+		if r == "ram" and w == "ram" then return nil end
+		if w == "none" or w == "rom" then
+			if r == "rom" or r == "ram" then
+				return "rom_target", string.format("read-only memory (read handler '%s', write handler '%s')", r, w)
+			end
+		end
+		if (r == "unmap" or r == "nop" or r == "none") and (w == "unmap" or w == "nop" or w == "none") then
+			return "unmapped_target", string.format("unmapped/ignored (read handler '%s', write handler '%s')", r, w)
+		end
+		return "unsupported_target", string.format("handlers read='%s' write='%s' are not plain RAM; only plain RAM is writable", tostring(r), tostring(w))
+	end
+
+	function ops.write_memory(args)
+		local dev, err = find_cpu(args.cpu)
+		if not dev then return nil, err end
+		local space_name = args.space
+		if type(space_name) ~= "string" then return fail("bad_argument", "space is required (e.g. 'program')") end
+		local sp = dev.spaces[space_name]
+		if not sp then return fail("unknown_space", "cpu " .. args.cpu .. " has no address space '" .. space_name .. "'") end
+		if sp.shift ~= 0 then return fail("unsupported_space", "address shift " .. sp.shift .. " not supported") end
+		if space_name ~= "program" and space_name ~= "data" then
+			return fail("unsupported_space", "writes are supported only to the program and data spaces")
+		end
+		local addr, e1 = parse_uint(args.address, "address")
+		if not addr then return nil, e1 end
+		local width = parse_uint(args.width, "width")
+		if width ~= 1 and width ~= 2 and width ~= 4 then
+			return fail("bad_argument", "width must be 1, 2 or 4 (bytes)")
+		end
+		local value, e2 = parse_uint(args.value, "value")
+		if not value then return nil, e2 end
+		if value >= (1 << (8 * width)) then
+			return fail("bad_argument", string.format("value %s does not fit in %d byte(s)", hex(value), width))
+		end
+		if addr % width ~= 0 then return fail("bad_argument", "address must be aligned to the width (" .. width .. ")") end
+		local last = addr + width - 1
+		if last > sp.address_mask then
+			return fail("out_of_range", string.format("range %s-%s exceeds address mask %s", hex(addr), hex(last), hex(sp.address_mask)))
+		end
+		-- state guards, after argument validation
+		local ok, e = busy_guard("write_memory"); if not ok then return nil, e end
+		ok, e = instrumentation_guard("write_memory"); if not ok then return nil, e end
+		if not execution_stopped() then
+			return fail("execution_running", "write_memory requires paused or debugger-stopped execution (execution_control pause); a write under running emulation is not ordered with the machine")
+		end
+		for a = addr, last do
+			local entry, why = map_entry_for(sp, a)
+			if why then return fail("unsupported_target", why) end
+			local code, msg = ram_verdict(entry)
+			if code then
+				return fail(code, string.format("%s %s: %s", args.cpu .. "/" .. space_name, hex(a), msg),
+					{ address = hex(a), read_handler = entry and entry.read.handlertype or nil, write_handler = entry and entry.write.handlertype or nil })
+			end
+		end
+		local reader = ({ [1] = "read_u8", [2] = "read_u16", [4] = "read_u32" })[width]
+		local writer = ({ [1] = "write_u8", [2] = "write_u16", [4] = "write_u32" })[width]
+		local st = emu.symbol_table(dev)
+		local letter = SPACE_LETTER[space_name]
+		local function snapshot()
+			local v = sp[reader](sp, addr)
+			local bytes = {}
+			for i = 0, width - 1 do bytes[#bytes + 1] = string.format("%02x", st:memory_value(args.cpu, letter, addr + i, 1, true)) end
+			return { value = v, hex = hex(v), bytes_hex = table.concat(bytes) }
+		end
+		local before = snapshot()
+		sp[writer](sp, addr, value)
+		local after = snapshot()
+		local verified = after.value == value
+		local rolled_back
+		if not verified then
+			sp[writer](sp, addr, before.value)
+			rolled_back = snapshot().value == before.value
+		end
+		local out = {
+			cpu = args.cpu, space = space_name, address = hex(addr), width = width,
+			before = before, requested = { value = value, hex = hex(value) }, after = after,
+			verified = verified, changed = before.value ~= after.value,
+			byte_order = "bytes_hex lists bytes in ascending address order; value is the width-bit integer in the space's native endianness",
+			execution = exec_state(), clock = emu_clock(),
+		}
+		if not verified then
+			return fail("write_verification_failed", string.format("wrote %s but read back %s at %s; the original value was %s", hex(value), after.hex, hex(addr),
+				rolled_back and "restored" or "NOT restored (inspect the address)"), out)
+		end
+		return out
+	end
+
+	---------------------------------------------------------------------------
+	-- checkpoints: save / load machine state (session-owned files)
+	---------------------------------------------------------------------------
+	-- API choice (verified against the MAME 0.289 source and the real binary, docs/VALIDATION.md):
+	--   * Lua machine:save()/load() are only SCHEDULED, report nothing, and never complete while emulation is stopped in the
+	--     debugger. buffer_save/buffer_load are marked broken upstream. Not used as the primary path.
+	--   * The debugger's 'statesave'/'stateload' call running_machine::immediate_save/immediate_load, which are synchronous
+	--     and designed for the stopped state. A command string is assembled here ONLY from a validated checkpoint id.
+	--   * If MAME cannot save at that instant (it has temporary timers: can_save() is false) the immediate call stays
+	--     pending inside MAME. Then the scheduled API is used and emulation is allowed to run until MAME completes it, after
+	--     which the previous execution state is restored. That path is reported as mode='scheduled' and is less exact.
+	-- Completion is never assumed: a save is complete when the file exists with a valid header; a load is complete when the
+	-- frame counter and every CPU's architectural registers match the values recorded at save time.
+	local ID_PATTERN = "^[A-Za-z0-9][A-Za-z0-9_%-]*$"
+	local load_window_ok  -- defined below
+
+	local function ckpt_path(id)
+		return cfg.state_dir .. "/" .. machine().system.name .. "/" .. id .. ".sta"
+	end
+
+	-- MAME state file header (save.cpp, HEADER_SIZE 0x20): "MAMESAVE", version, endian flag, 18-byte system name, u32le signature.
+	local function read_header(path)
+		local f = io.open(path, "rb")
+		if not f then return nil end
+		local size = f:seek("end")
+		f:seek("set", 0)
+		local h = f:read(32)
+		f:close()
+		if not h or #h < 32 then return { ok = false, size = size, reason = "file shorter than the 32-byte state header" } end
+		local name = h:sub(11, 28):match("^[^%z]*")
+		local sysname = machine().system.name
+		local hd = {
+			size = size, magic = h:sub(1, 8), version = h:byte(9), system = name,
+			signature = string.format("%02x%02x%02x%02x", h:byte(32), h:byte(31), h:byte(30), h:byte(29)),
+		}
+		hd.ok = hd.magic == "MAMESAVE" and name == sysname
+		if not hd.ok then hd.reason = (hd.magic ~= "MAMESAVE") and "not a MAME state file" or ("state file is for '" .. name .. "', this machine is '" .. sysname .. "'") end
+		return hd
+	end
+
+	-- FNV-1a over MAME's memory SHARES (the RAM pools drivers expose; plain anonymous RAM is not a share and is not covered),
+	-- bounded by LIMITS.max_digest_bytes. It lets a load be verified when only RAM differs (registers and frame alone cannot
+	-- tell a paused state from the same state with changed RAM).
+	local function ram_digest()
+		local shares = machine().memory.shares
+		local h, total, hashed, partial = 2166136261, 0, 0, false
+		local tags = sorted_keys(shares)
+		for _, tag in ipairs(tags) do
+			local sh = shares[tag]
+			local size = sh.size
+			total = total + size
+			for i = 1, #tag do h = ((h ~ tag:byte(i)) * 16777619) & 0xffffffff end
+			local n = math.min(size, LIMITS.max_digest_bytes - hashed)
+			for off = 0, n - 1 do h = ((h ~ sh:read_u8(off)) * 16777619) & 0xffffffff end
+			hashed = hashed + n
+			if n < size then partial = true end
+		end
+		return { digest = string.format("%08x", h), shares = #tags, bytes_hashed = hashed, bytes_total = total, partial = partial }
+	end
+
+	-- Frame counter + every CPU's registers + a RAM digest, except the debugger's derived CUR* pseudo-registers (CURFLAGS
+	-- differed across an identical save/load on the Z80 in testing; CURPC is redundant with PC).
+	local function fingerprint()
+		local fp = { frame = frame_now() or -1, cpus = {}, exact = true }
+		for tag, dev in pairs(machine().devices) do
+			local has = false
+			for _ in pairs(dev.spaces) do has = true break end
+			if has then
+				local regs = {}
+				for name, st in pairs(dev.state) do
+					if not name:match("^CUR") then
+						local ok, v = pcall(function() return st.value end)
+						if ok and math.type(v) == "integer" then regs[name] = string.format("%X", v) end
+					end
+				end
+				fp.cpus[tag] = regs
+			end
+		end
+		local okr, ram = pcall(ram_digest)
+		if okr then fp.ram = ram end
+		return fp
+	end
+
+	local function fingerprint_diff(expect, got)
+		local d = {}
+		if expect.frame ~= got.frame then d[#d + 1] = string.format("frame %s != %s", tostring(expect.frame), tostring(got.frame)) end
+		if expect.ram and got.ram and expect.ram.digest ~= got.ram.digest then
+			d[#d + 1] = string.format("ram digest %s != %s", tostring(expect.ram.digest), tostring(got.ram.digest))
+		end
+		local n = 0
+		for tag, regs in pairs(expect.cpus or {}) do
+			local g = got.cpus[tag]
+			if not g then d[#d + 1] = tag .. " missing"
+			else
+				for name, v in pairs(regs) do
+					n = n + 1
+					if g[name] ~= v and #d < 8 then d[#d + 1] = string.format("%s.%s %s != %s", tag, name, tostring(v), tostring(g[name])) end
+				end
+			end
+		end
+		return d, n
+	end
+
+	local function resume_exec()
+		local dbg = machine().debugger
+		if dbg then dbg.execution_state = "run" end
+		emu.unpause()
+	end
+
+	local function restore_exec(before)
+		local dbg = machine().debugger
+		if before == "debugger_stopped" and dbg then dbg.execution_state = "stop"
+		elseif before == "paused" then emu.pause() end
+	end
+
+	ckpt_summary = function()
+		local sys = machine().system
+		return {
+			available = cfg.state_dir ~= nil, state_dir = cfg.state_dir, supports_save = opt(function() return sys.supports_save end),
+			pending = ckpt_pending and { kind = ckpt_pending.kind, id = ckpt_pending.id } or nil,
+			last = ckpt_last and { kind = ckpt_last.kind, id = ckpt_last.id, state = ckpt_last.state } or nil,
+			primary_path = "debugger statesave/stateload (synchronous); scheduled machine:save/load as fallback",
+		}
+	end
+
+	local function ckpt_guard(what)
+		local m = machine()
+		if not cfg.state_dir then
+			return fail("checkpoint_unavailable", "this MAME was not started with a managed state directory (MAMEMCP_STATE_DIR); checkpoints are available only in managed sessions")
+		end
+		if not m.debugger then return fail("debugger_unavailable", "checkpoints need MAME's debugger (start MAME with -debug)") end
+		if opt(function() return m.system.supports_save end) == false then
+			return fail("unsupported_machine", "MAME reports that '" .. m.system.name .. "' does not support save states (MACHINE_SUPPORTS_SAVE is not set); " .. what .. " is refused for it")
+		end
+		local ok, e = busy_guard(what); if not ok then return nil, e end
+		ok, e = instrumentation_guard(what); if not ok then return nil, e end
+		if not execution_stopped() then
+			return fail("execution_running", what .. " requires paused or debugger-stopped execution (execution_control pause)")
+		end
+		return true
+	end
+
+	local function ckpt_result(rec, extra)
+		local r = {
+			state = "completed", kind = rec.kind, id = rec.id, path = rec.path, mode = rec.mode,
+			execution_before = rec.exec_before, execution = exec_state(), clock = emu_clock(),
+			frames_run_during_operation = (frame_now() or 0) - rec.start_frame,
+			state_epoch = epoch,
+		}
+		for k, v in pairs(extra or {}) do r[k] = v end
+		return r
+	end
+
+	local function ckpt_fail(rec, code, message, extra)
+		local detail = { kind = rec.kind, id = rec.id, mode = rec.mode, execution_before = rec.exec_before,
+			frames_run_during_operation = (frame_now() or 0) - rec.start_frame, state_epoch = epoch }
+		for k, v in pairs(extra or {}) do detail[k] = v end
+		return { code = code, message = message, detail = detail }
+	end
+
+	local function finish_save(rec, hd)
+		local r = ckpt_result(rec, {
+			size = hd.size, header = { magic = hd.magic, version = hd.version, system = hd.system, signature = hd.signature },
+			fingerprint = rec.fp, frame = rec.fp.frame, emu_time_s = rec.saved_clock and rec.saved_clock.emu_time_s or nil,
+			state_machine = machine().system.name, mame_version = emu.app_version(),
+		})
+		return r
+	end
+
+	local function finish_load(rec, post, exact)
+		local effect_observed = rec.pre_fp.frame ~= rec.expect.frame
+		if not effect_observed then
+			local d = fingerprint_diff(rec.expect, rec.pre_fp)
+			effect_observed = #d > 0
+		end
+		-- every invalidation below describes the timeline that was just replaced
+		epoch = epoch + 1
+		local invalid = {}
+		for _, id in ipairs(order) do
+			local e = experiments[id]
+			if e and e.epoch < epoch then invalid[#invalid + 1] = id end
+		end
+		local _, nregs = fingerprint_diff(rec.expect, post)
+		return ckpt_result(rec, {
+			verification = {
+				method = exact and "frame_and_cpu_registers_exact" or "frame_window",
+				exact = exact, load_effect_observed = effect_observed,
+				expected_frame = rec.expect.frame, frame_before_load = rec.pre_fp.frame, frame_after_load = post.frame,
+				registers_compared = nregs, ignored = "debugger-derived CUR* pseudo-registers",
+				ram_digest = exact and post.ram or nil,
+				ram_coverage = "memory shares only (RAM pools MAME exposes by tag); anonymous RAM is not covered",
+			},
+			invalidated_experiments = invalid,
+			note = "emulated state replaced; experiment ids recorded before this load are now refused as stale",
+		})
+	end
+
+	local function ckpt_complete(rec, result)
+		rec.state = "completed"
+		ckpt_pending = nil
+		ckpt_last = result
+		restore_exec(rec.exec_before)
+		result.execution = exec_state()
+	end
+
+	local function ckpt_abort(rec, err)
+		ckpt_pending = nil
+		restore_exec(rec.exec_before)
+		err.detail.execution = exec_state()
+		ckpt_last = { state = "failed", kind = rec.kind, id = rec.id, error = err }
+	end
+
+	-- Scheduled fallback: hand the operation to MAME's own run loop and let emulation run until it has happened.
+	local function ckpt_defer(rec)
+		rec.mode = "scheduled"
+		local m = machine()
+		local ok, e = pcall(function()
+			if rec.kind == "save" then m:save(rec.id) else m:load(rec.id) end
+		end)
+		if not ok then
+			return nil, { code = "checkpoint_failed", message = "could not schedule the " .. rec.kind .. ": " .. tostring(e) }
+		end
+		rec.state = "pending"
+		ckpt_pending = rec
+		resume_exec()
+		return { state = "pending", kind = rec.kind, id = rec.id, mode = "scheduled",
+			note = "MAME could not complete the operation at this instant (temporary timers); emulation is running until it does, then the previous execution state is restored. Poll checkpoint_status." }
+	end
+
+	-- A restored state is recognised by the frame counter: it must land within a few frames after the checkpoint's frame
+	-- (emulation keeps running until the polling callback notices), and the machine must not already have been there.
+	load_window_ok = function(rec, frame)
+		local lo = rec.expect.frame
+		local hi = (rec.expect.frame_max or rec.expect.frame) + LIMITS.checkpoint_window_frames
+		return frame >= lo and frame <= hi and not (rec.pre_fp.frame >= lo and rec.pre_fp.frame <= hi)
+	end
+
+	local function ckpt_tick()
+		local rec = ckpt_pending
+		if not rec then return end
+		local now_frame = frame_now() or 0
+		if rec.kind == "save" then
+			local hd = read_header(rec.path)
+			if hd and hd.ok then
+				-- The state was written some time before this callback noticed: its exact frame/registers are unknown.
+				rec.fp = { frame = rec.start_frame, frame_max = now_frame, cpus = {}, exact = false }
+				return ckpt_complete(rec, finish_save(rec, hd))
+			end
+			if hd and not hd.ok and hd.size and hd.size >= 32 then
+				return ckpt_abort(rec, ckpt_fail(rec, "checkpoint_failed", "MAME wrote a state file that fails validation: " .. tostring(hd.reason)))
+			end
+		else
+			if load_window_ok(rec, now_frame) then
+				return ckpt_complete(rec, finish_load(rec, fingerprint(), false))
+			end
+		end
+		-- MAME itself gives up a deferred operation after one second of EMULATED time, so bound the attempt in emulated
+		-- frames too (a bad file must not let the machine run for the whole host timeout).
+		if host_ms() - rec.started_host_ms > LIMITS.checkpoint_timeout_ms or now_frame - rec.start_frame > LIMITS.checkpoint_max_frames then
+			local msg = (rec.kind == "save") and "MAME did not produce a valid state file in time"
+				or ((rec.pre_fp.frame >= rec.expect.frame and rec.pre_fp.frame <= rec.expect.frame + LIMITS.checkpoint_window_frames)
+					and "could not confirm the load: the machine was already within a few frames of the checkpoint, so a restored state cannot be told apart from the current one"
+					or "MAME did not restore the checkpoint (frame counter never returned to the saved frame); the file may be incompatible or corrupt")
+			return ckpt_abort(rec, ckpt_fail(rec, rec.kind == "save" and "checkpoint_failed" or "checkpoint_not_applied", msg,
+				{ expected_frame = rec.expect and rec.expect.frame or nil, frame_now = now_frame }))
+		end
+	end
+
+	local function new_rec(kind, id, expect)
+		return { kind = kind, id = id, path = ckpt_path(id), mode = "immediate", exec_before = exec_state().state,
+			started_host_ms = host_ms(), start_frame = frame_now() or 0, pre_fp = fingerprint(), expect = expect }
+	end
+
+	local function valid_id(id)
+		return type(id) == "string" and #id <= 96 and id:match(ID_PATTERN) ~= nil
+	end
+
+	function ops.checkpoint_save(args)
+		if not valid_id(args.id) then return fail("bad_argument", "id must be 1-96 characters: letters, digits, '_' or '-'") end
+		local ok, e = ckpt_guard("save_checkpoint"); if not ok then return nil, e end
+		local rec = new_rec("save", args.id, nil)
+		rec.fp = rec.pre_fp
+		rec.saved_clock = emu_clock()
+		if read_header(rec.path) then
+			return fail("checkpoint_exists", "a state file for id " .. args.id .. " already exists; checkpoint ids are never overwritten")
+		end
+		if not cfg.test_force_scheduled_checkpoint then
+			local okc, errc = pcall(function() machine().debugger:command("statesave " .. args.id) end)
+			if not okc then return fail("checkpoint_failed", "statesave raised: " .. tostring(errc)) end
+			local hd = read_header(rec.path)
+			if hd and hd.ok then
+				ckpt_last = finish_save(rec, hd)
+				return ckpt_last
+			end
+			if hd and not hd.ok then
+				pcall(os.remove, rec.path)
+				return fail("checkpoint_failed", "MAME wrote a state file that fails validation (removed): " .. tostring(hd.reason))
+			end
+		end
+		local res, derr = ckpt_defer(rec)
+		if not res then return nil, derr end
+		return res
+	end
+
+	function ops.checkpoint_load(args)
+		if not valid_id(args.id) then return fail("bad_argument", "id must be 1-96 characters: letters, digits, '_' or '-'") end
+		local expect = args.expect
+		if type(expect) ~= "table" or type(expect.cpus) ~= "table" then
+			return fail("bad_argument", "expect must be the fingerprint recorded when the checkpoint was saved ({frame, cpus})")
+		end
+		local ef, eframe = parse_uint(expect.frame, "expect.frame")
+		if not ef then return nil, eframe end
+		expect.frame = ef
+		if expect.frame_max ~= nil then
+			local fm, efm = parse_uint(expect.frame_max, "expect.frame_max")
+			if not fm then return nil, efm end
+			expect.frame_max = fm
+		end
+		local ok, e = ckpt_guard("load_checkpoint"); if not ok then return nil, e end
+		local rec = new_rec("load", args.id, expect)
+		local hd = read_header(rec.path)
+		if not hd then return fail("checkpoint_not_found", "no state file for id " .. args.id .. " in this session's state directory") end
+		if not hd.ok then
+			return fail("checkpoint_incompatible", "state file rejected before loading: " .. tostring(hd.reason), { header = hd })
+		end
+		if not cfg.test_force_scheduled_checkpoint then
+			local okc, errc = pcall(function() machine().debugger:command("stateload " .. args.id) end)
+			if not okc then return fail("checkpoint_failed", "stateload raised: " .. tostring(errc)) end
+			local post = fingerprint()
+			if expect.exact ~= false then
+				local d = fingerprint_diff(expect, post)
+				if #d == 0 then
+					ckpt_last = finish_load(rec, post, true)
+					return ckpt_last
+				end
+			elseif load_window_ok(rec, post.frame) then
+				ckpt_last = finish_load(rec, post, false)
+				return ckpt_last
+			end
+		end
+		local res, derr = ckpt_defer(rec)
+		if not res then return nil, derr end
+		return res
+	end
+
+	function ops.checkpoint_status(args)
+		if ckpt_pending then
+			return { state = "pending", kind = ckpt_pending.kind, id = ckpt_pending.id, mode = ckpt_pending.mode,
+				elapsed_ms = host_ms() - ckpt_pending.started_host_ms, execution = exec_state() }
+		end
+		return ckpt_last or { state = "none" }
 	end
 
 	---------------------------------------------------------------------------
@@ -1277,6 +2041,18 @@ function exports.startplugin()
 	end
 
 	local function housekeeping()
+		if ckpt_pending then
+			local okc, ec = pcall(ckpt_tick)
+			if not okc then
+				print("mamemcp: checkpoint tick error: " .. tostring(ec))
+				local rec = ckpt_pending
+				if rec then
+					ckpt_pending = nil
+					restore_exec(rec.exec_before)
+					ckpt_last = { state = "failed", kind = rec.kind, id = rec.id, error = { code = "internal_error", message = tostring(ec), detail = {} } }
+				end
+			end
+		end
 		local exp = active
 		if not exp or exp.state ~= "running" then return end
 		harvest(exp)
@@ -1309,6 +2085,7 @@ function exports.startplugin()
 
 	stop_sub = emu.add_machine_stop_notifier(function()
 		stopping = true
+		pcall(release_inputs, "machine_stop")
 		if active then
 			-- MAME is exiting; breakpoints die with it. Record what we know.
 			pcall(finalize, active, "mame_exit")

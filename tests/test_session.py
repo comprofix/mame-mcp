@@ -69,6 +69,8 @@ class FakeClient:
             if self.cancel_error:
                 raise self.cancel_error
             return {"state": "cancelled", "completion_reason": "cancelled", "cleanup": {"verified": self.cancel_verified}}
+        if op == "input_cancel":  # teardown always releases held inputs first; nothing is held in these tests
+            return {"state": "none", "was_holding": False, "release_errors": []}
         raise AssertionError(op)
 
     def close(self, graceful=True):

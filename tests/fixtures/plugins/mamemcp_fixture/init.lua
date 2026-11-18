@@ -160,6 +160,39 @@ function exports.startplugin()
 	end
 	function ops.soft_reset() manager.machine:soft_reset(); return { requested = "soft_reset" } end
 
+	-- Independent input observer (TEST-ONLY): counts, per emulated frame, whether a port's masked bits differ from the idle
+	-- value sampled when the watch started. It reads the port the machine itself reads, in its own frame notifier, so it does
+	-- not share any code path with the bridge's input counting.
+	local watch = nil
+	function ops.watch_port(a)
+		local port = manager.machine.ioport.ports[a.port]
+		if a.stop then
+			local w = watch
+			watch = nil
+			return { pressed_frames = w and w.pressed or 0, frames_seen = w and w.total or 0, pressed_frame_numbers = w and w.numbers or {},
+				last_pressed_frame = w and w.last or nil, frames_after_last_press = w and w.after or 0 }
+		end
+		watch = { port = a.port, mask = a.mask, idle = port:read(), pressed = 0, total = 0, numbers = {}, after = 0 }
+		return { watching = true, idle = watch.idle }
+	end
+	local screen
+	emu.register_frame_done(function()
+		if not watch then return end
+		if not screen then
+			for _, s in pairs(manager.machine.screens) do screen = s break end
+		end
+		local v = manager.machine.ioport.ports[watch.port]:read()
+		watch.total = watch.total + 1
+		if ((v ~ watch.idle) & watch.mask) ~= 0 then
+			watch.pressed = watch.pressed + 1
+			watch.last = screen:frame_number()
+			watch.after = 0
+			if #watch.numbers < 200 then watch.numbers[#watch.numbers + 1] = watch.last end
+		elseif watch.last then
+			watch.after = watch.after + 1
+		end
+	end)
+
 	local cmdpath, replypath, tmppath = dir .. "/cmd.json", dir .. "/reply.json", dir .. "/reply.tmp"
 	emu.register_periodic(function()
 		if cycler then

@@ -117,5 +117,87 @@
     "start": "0x8",
     "end": "0xB",
     "note": "68000 vector-table entry (bus-error/address-error vectors): ROM, not read by normal execution, so tap calls come only from the test's reads"
+  },
+  "checkpoint_input": {
+    "_comment": "Machine-specific facts for the checkpoint / RAM-write / input validation (MAME 0.289, declared 68000 program-space map of shinobi). The server contains none of these.",
+    "maincpu": ":maincpu",
+    "space": "program",
+    "ram": {
+      "address": "0xC70010",
+      "note": "work/battery RAM share 'nvram' (0xC70000-0xC73FFF); plain RAM in the declared map",
+      "mirror_address": "0xC74010",
+      "mirror_note": "same RAM through the map's mirror bits (0x38C000)",
+      "sprite_ram": "0x440010"
+    },
+    "ram_widths": {
+      "1": {
+        "address": "0xC70010",
+        "value": "0x5A"
+      },
+      "2": {
+        "address": "0xC70020",
+        "value": "0xBEEF"
+      },
+      "4": {
+        "address": "0xC70024",
+        "value": "0xDEADBEEF"
+      }
+    },
+    "rom": {
+      "address": "0x1000",
+      "note": "program ROM region, read handler rom / write handler none"
+    },
+    "unmapped": {
+      "address": "0x040000",
+      "note": "no entry in the declared map (gap between the mirrored ROM images)"
+    },
+    "device_handled": {
+      "address": "0x400000",
+      "note": "tile RAM: delegate handlers"
+    },
+    "io": {
+      "address": "0xC40000",
+      "note": "memory-mapped I/O: delegate handlers"
+    },
+    "input": {
+      "press": [
+        {
+          "port": ":P1",
+          "field": "P1 Button 1"
+        }
+      ],
+      "watch": {
+        "port": ":P1",
+        "mask": 2,
+        "note": "active-low P1 port; Button 1 is bit 1"
+      },
+      "multi": [
+        {
+          "port": ":P1",
+          "field": "P1 Left"
+        },
+        {
+          "port": ":P1",
+          "field": "P1 Button 2"
+        }
+      ],
+      "unsupported": {
+        "analog_or_toggle": {
+          "port": ":DSW1",
+          "field": "Coin A"
+        },
+        "unknown_port": ":NOPE",
+        "unknown_field": {
+          "port": ":P1",
+          "field": "Nope"
+        }
+      },
+      "supported_count": 20,
+      "unsupported_count": 8
+    },
+    "unsupported_machine": {
+      "system": "005",
+      "note": "driver without MACHINE_SUPPORTS_SAVE (-listxml savestate=\"unsupported\")"
+    }
   }
 }

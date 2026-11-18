@@ -73,7 +73,12 @@ mcp = MCPServer(
         "capture_breakpoint starts an asynchronous, limit-bounded experiment inside MAME: poll "
         "experiment_status. Detailed events are written to JSONL evidence files, not returned here. "
         "Experiment ids belong to one session; ids from an earlier session are refused. "
-        "CPU addresses are not ROM file offsets: banked memory means one CPU address can map to different code."
+        "CPU addresses are not ROM file offsets: banked memory means one CPU address can map to different code. "
+        "Gameplay checkpoints (managed sessions only): list_inputs shows the machine's real digital inputs; press_inputs "
+        "holds them for a bounded number of EMULATED frames (nothing elapses while stopped); save_checkpoint / "
+        "load_checkpoint need paused or debugger-stopped execution, no active capture and no held input, and a load makes "
+        "every earlier experiment id stale; write_memory changes one explicit RAM location (stopped execution only, "
+        "plain RAM only) and reads it back. There is no arbitrary Lua or debugger command execution."
     ),
 )
 
@@ -310,6 +315,90 @@ async def execution_control(action: Literal["pause", "resume"]) -> dict[str, Any
     confirmed: re-check with session_info. Included only because experiments need a way to get MAME
     running; it does not single-step or run debugger commands."""
     return await anyio.to_thread.run_sync(lambda: _call("execution_control", action))
+
+
+@mcp.tool()
+async def list_inputs(include_unsupported: bool = False) -> dict[str, Any]:
+    """List the machine's input ports and fields as MAME exposes them: port tag, field name, class, player, mask, and the
+    port's current value. Only digital controller/misc fields (joystick directions, buttons, coin, start, service) can be
+    pressed; `supported` and `unsupported_reason` say which. Analog, toggle, DIP-switch and configuration fields are
+    unsupported and listed only with include_unsupported=true. Use the exact `port` and `field` strings with press_inputs.
+    Read-only."""
+    args = _validated(protocol.list_inputs_args, include_unsupported)
+    return await anyio.to_thread.run_sync(lambda: _call("list_inputs", args))
+
+
+@mcp.tool()
+async def press_inputs(inputs: list[dict[str, str]], frames: int, wait: bool = True, max_wait_s: float | None = None) -> dict[str, Any]:
+    """Hold 1..8 distinct digital inputs ({"port": ":P1", "field": "P1 Button 1"}, names from list_inputs) for `frames`
+    (1..600) EMULATED frames, then release them. Frames are counted from the emulator's frame notifier, so they elapse
+    only while emulation RUNS: a press made while paused or debugger-stopped is armed and held, its frame count starts when
+    emulation resumes, and no other state-changing operation is accepted meanwhile. The machine sees the input from the
+    next frame for exactly `frames` frames. With wait=true (default) the call returns once the press has been released (or
+    execution stopped, or max_wait_s passed); with wait=false it returns as soon as the press is armed - poll
+    session_info.input. Released on completion, release_inputs, stop_session, server shutdown, a bridge error during the
+    wait, and when the bridge client disconnects. Analog, toggle, DIP-switch and configuration fields are refused."""
+    try:
+        return await anyio.to_thread.run_sync(lambda: manager.press_inputs(inputs, frames, wait, max_wait_s))
+    except BridgeError as e:
+        raise _fail(e) from e
+
+
+@mcp.tool()
+async def release_inputs() -> dict[str, Any]:
+    """Release any held inputs now (idempotent). Reports whether anything was held and why/how it ended."""
+    try:
+        return await anyio.to_thread.run_sync(manager.release_inputs)
+    except BridgeError as e:
+        raise _fail(e) from e
+
+
+@mcp.tool()
+async def save_checkpoint(label: str | None = None) -> dict[str, Any]:
+    """Save the emulated machine state to a session-owned file and return a checkpoint id. Requires paused or
+    debugger-stopped execution (execution_control pause), no active capture, no unresolved instrumentation and no held
+    input; a machine MAME reports as not supporting save states is refused. Returns only after the file exists and has been
+    validated (size, SHA-256, MAME header); the execution state is unchanged (see `mode`: 'immediate' is exact; if MAME
+    could not save at that instant it runs briefly and the result says so). Files and metadata stay in the session's run
+    directory, so ids remain loadable by later sessions of the same machine and MAME version."""
+    try:
+        return await anyio.to_thread.run_sync(lambda: manager.save_checkpoint(label))
+    except BridgeError as e:
+        raise _fail(e) from e
+
+
+@mcp.tool()
+async def load_checkpoint(checkpoint_id: str) -> dict[str, Any]:
+    """Restore a checkpoint (from this or an earlier session of the same machine and MAME version). Same preconditions as
+    save_checkpoint. The id, machine, MAME version and file SHA-256 are validated first; the load is reported complete only
+    after the frame counter and every CPU's registers match what was recorded at save time (`verification`). Experiment ids
+    recorded before the load become stale and are refused (their evidence files stay on disk); the bridge session id is
+    re-checked. Execution stays in the state it was in."""
+    try:
+        return await anyio.to_thread.run_sync(lambda: manager.load_checkpoint(checkpoint_id))
+    except BridgeError as e:
+        raise _fail(e) from e
+
+
+@mcp.tool()
+async def list_checkpoints(include_previous_sessions: bool = True) -> dict[str, Any]:
+    """List checkpoints of the current session and, by default, of earlier sessions under the runs directory (metadata
+    only; works with no MAME running)."""
+    return await anyio.to_thread.run_sync(lambda: manager.list_checkpoints(include_previous_sessions))
+
+
+@mcp.tool()
+async def write_memory(cpu: str, space: str, address: int | str, value: int | str, width: Literal[1, 2, 4]) -> dict[str, Any]:
+    """Write ONE value to plain RAM: `cpu` (device tag), `space` ('program' or 'data'), `address` (aligned to `width`),
+    `value` (fits in `width` bytes; the width-bit integer in the space's native endianness) and `width` in BYTES (1, 2 or 4)
+    - all required. Requires paused or debugger-stopped execution, no active capture, no unresolved instrumentation, no
+    held input and no pending checkpoint. The target must be RAM in the CPU's address map: ROM, unmapped, I/O, banked and
+    device-handled addresses are refused. The value is read back; the result reports before, requested and actual values,
+    and a mismatch is rolled back and reported as an error. Not a debugger or Lua interface."""
+    try:
+        return await anyio.to_thread.run_sync(lambda: manager.write_memory(cpu, space, address, value, width))
+    except BridgeError as e:
+        raise _fail(e) from e
 
 
 def _install_exit_handlers() -> None:

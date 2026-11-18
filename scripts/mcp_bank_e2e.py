@@ -69,8 +69,8 @@ async def main() -> int:
             async with ClientSession(read, write) as s:
                 await s.initialize()
                 tools = {t.name: t for t in (await s.list_tools()).tools}
-                check("MCP: read_memory advertises bank_context; no memory-write or bank-select tool exists",
-                      "bank_context" in tools["read_memory"].input_schema["properties"] and not any(k in n for n in tools for k in ("write", "select", "poke", "bank")), tools=sorted(tools))
+                check("MCP: read_memory advertises bank_context; no bank-select / poke tool exists (the only writer is the typed, RAM-only write_memory from the later checkpoint milestone)",
+                      "bank_context" in tools["read_memory"].input_schema["properties"] and not any(k in n for n in tools for k in ("select", "poke", "bank")) and [n for n in tools if "write" in n] == ["write_memory"], tools=sorted(tools))
                 si = payload(await s.call_tool("session_info", {}))
                 bc = si.get("bridge_client", {})
                 check("MCP: session_info shows machine 1942, MAME 0.289, wake nudge configured", si["machine"]["name"] == "1942" and si["mame_version"] == "0.289" and bc.get("wake_configured") is True,

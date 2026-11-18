@@ -11,7 +11,7 @@ from typing import Any
 from .protocol import PROTOCOL_VERSION, BridgeError
 
 LOOPBACK = "127.0.0.1"
-RETRY_SAFE_OPS = frozenset({"session_info", "read_registers", "experiment_status"})
+RETRY_SAFE_OPS = frozenset({"session_info", "read_registers", "experiment_status", "input_status", "checkpoint_status", "list_inputs"})
 
 
 class BridgeClient:
@@ -22,7 +22,7 @@ class BridgeClient:
     * The session id learned from the handshake is sent with every later request, so a
       restarted MAME (new session) is rejected rather than silently accepted.
     * Nothing is retried unless the caller marks the request `retry_safe` (see RETRY_SAFE_OPS). Only
-      operations that are side-effect free and idempotent qualify: session_info, read_registers,
+      operations that are side-effect free and idempotent qualify: session_info, read_registers, input_status, checkpoint_status, list_inputs,
       experiment_status. State-changing ops and memory reads are never retried automatically.
       A retry happens at most once, only after request_timeout, only on the same connection and
       session; a connection loss or session change is raised, never retried. The first attempt's late
@@ -240,3 +240,9 @@ class BridgeClient:
 
     def execution_control(self, action: str) -> dict[str, Any]:
         return self.request("execution_control", {"action": action}, mutating=True)
+
+    def list_inputs(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self.request("list_inputs", args, retry_safe=True)
+
+    def write_memory(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self.request("write_memory", args, mutating=True)

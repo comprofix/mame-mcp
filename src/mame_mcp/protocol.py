@@ -17,6 +17,12 @@ MAX_MEMORY_FIELDS = 8
 MAX_EVENTS = 10000
 MAX_LOCATIONS = 8  # breakpoint locations per experiment; each is one MAME breakpoint on one CPU (temps are shared, not per location)
 MAX_WALL_SECONDS = 600
+MAX_INPUT_FIELDS = 8
+MAX_INPUT_FRAMES = 600
+WRITE_WIDTHS = (1, 2, 4)  # bytes
+MAX_LABEL = 80
+# <run_id>-cp<NNN>: run_id is <system>-<YYYYMMDD>-<HHMMSS>-<6 hex> (session.py); the id alone names the owning session
+CHECKPOINT_ID = re.compile(r"^(?P<run>[a-z0-9][a-z0-9_]{0,31}-\d{8}-\d{6}-[0-9a-f]{6})-cp(?P<n>\d{3,6})$")
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LOC_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,23}$")
 _TAG = re.compile(r"^:[A-Za-z0-9_:.\-]+$")
@@ -164,3 +170,65 @@ def check_locations(locations: Any) -> list[dict[str, Any]]:
         addrs.add(addr)
         out.append({"id": lid, "address": addr})
     return out
+
+
+# ------------------------------------------------------------------------------------------------ memory writes
+def write_memory_args(cpu: str, space: str, address: Any, value: Any, width: Any) -> dict[str, Any]:
+    """Every field is explicit: no defaults for the CPU, address space, address, value or width (bytes: 1, 2 or 4)."""
+    if isinstance(width, bool) or not isinstance(width, int) or width not in WRITE_WIDTHS:
+        raise _bad(f"width must be one of {WRITE_WIDTHS} (bytes)")
+    if not isinstance(space, str) or not _IDENT.match(space):
+        raise _bad("space must be an address space name such as 'program'")
+    addr = check_uint(address, "address", maximum=0xFFFFFFFF)
+    if addr % width:
+        raise _bad(f"address {addr:#x} is not aligned to the width ({width})")
+    return {
+        "cpu": check_tag(cpu), "space": space, "address": addr, "width": width,
+        "value": check_uint(value, "value", maximum=(1 << (8 * width)) - 1),
+    }
+
+
+# ------------------------------------------------------------------------------------------------ inputs
+_FIELD_NAME = re.compile(r"^[\x20-\x7e]{1,64}$")  # printable ASCII; MAME field names such as "Enemy's Bullet Speed"
+
+
+def list_inputs_args(include_unsupported: Any) -> dict[str, Any]:
+    if not isinstance(include_unsupported, bool):
+        raise _bad("include_unsupported must be true or false")
+    return {"include_unsupported": include_unsupported}
+
+
+def press_args(inputs: Any, frames: Any) -> dict[str, Any]:
+    """1..MAX_INPUT_FIELDS distinct {port, field} digital inputs held together for 1..MAX_INPUT_FRAMES emulated frames."""
+    if not isinstance(inputs, list) or not 1 <= len(inputs) <= MAX_INPUT_FIELDS:
+        raise _bad(f"inputs must be a list of 1..{MAX_INPUT_FIELDS} objects with 'port' and 'field'")
+    out, seen = [], set()
+    for i, item in enumerate(inputs):
+        if not isinstance(item, dict) or set(item) != {"port", "field"}:
+            raise _bad(f"inputs[{i}] must be an object with exactly 'port' and 'field'")
+        port, name = check_tag(item["port"]), item["field"]
+        if not isinstance(name, str) or not _FIELD_NAME.fullmatch(name):
+            raise _bad(f"inputs[{i}].field must be 1-64 printable ASCII characters (a field name from list_inputs)")
+        if (port, name) in seen:
+            raise _bad(f"duplicate input {port}/{name}")
+        seen.add((port, name))
+        out.append({"port": port, "field": name})
+    if isinstance(frames, bool) or not isinstance(frames, int) or not 1 <= frames <= MAX_INPUT_FRAMES:
+        raise _bad(f"frames must be an integer 1..{MAX_INPUT_FRAMES} (emulated frames)")
+    return {"inputs": out, "frames": frames}
+
+
+# ------------------------------------------------------------------------------------------------ checkpoints
+def check_label(label: Any) -> str | None:
+    if label is None:
+        return None
+    if not isinstance(label, str) or not label.strip() or len(label) > MAX_LABEL or any(ord(c) < 32 or ord(c) == 127 for c in label):
+        raise _bad(f"label must be 1-{MAX_LABEL} printable characters")
+    return label.strip()
+
+
+def check_checkpoint_id(cid: Any) -> re.Match[str]:
+    m = CHECKPOINT_ID.fullmatch(cid) if isinstance(cid, str) else None  # fullmatch: '$' would accept a trailing newline
+    if m is None:
+        raise _bad("checkpoint_id must be an id returned by save_checkpoint/list_checkpoints (<run_id>-cpNNN)")
+    return m

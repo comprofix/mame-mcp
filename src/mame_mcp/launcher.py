@@ -120,8 +120,9 @@ def launch(*, system: str = "shinobi", port: int = 9411, run_dir: Path | None = 
         (run_dir / "launch.json").write_text(json.dumps(info, indent=2))
     # TEST-ONLY fault-injection hooks (MAMEMCP_TEST_*) are never inherited from the ambient environment: they exist in the
     # MAME process only when a test passes them explicitly through `test_env`, and the launch record says so.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("MAMEMCP_TEST_") and k != "MAMEMCP_FIXTURE_DIR"}
-    env.update(MAMEMCP_PORT=str(port), MAMEMCP_EVIDENCE_DIR=_fwd(evidence))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MAMEMCP_TEST_") and k not in ("MAMEMCP_FIXTURE_DIR", "MAMEMCP_STATE_DIR")}
+    # MAMEMCP_STATE_DIR mirrors -state_directory (build_command) so the plugin can find the checkpoint files it asks MAME to write
+    env.update(MAMEMCP_PORT=str(port), MAMEMCP_EVIDENCE_DIR=_fwd(evidence), MAMEMCP_STATE_DIR=_fwd(run_dir / "home" / "sta"))
     for k, v in (test_env or {}).items():
         if not k.startswith("MAMEMCP_TEST_"):
             raise ValueError(f"test_env keys must start with MAMEMCP_TEST_: {k}")

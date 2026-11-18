@@ -106,7 +106,8 @@ async def main() -> int:
             tools = sorted(t.name for t in (await s.list_tools()).tools)
             check("A server initialises with no MAME; tools listed", tools == sorted([
                 "start_session", "stop_session", "session_info", "read_memory", "read_registers", "capture_breakpoint",
-                "experiment_status", "cancel_experiment", "execution_control"]), tools=tools)
+                "experiment_status", "cancel_experiment", "execution_control", "list_inputs", "press_inputs", "release_inputs",
+                "save_checkpoint", "load_checkpoint", "list_checkpoints", "write_memory"]), tools=tools)
             by_name = {t.name: t for t in (await s.list_tools()).tools}
             check("A start_session takes only a system name and a bounded timeout (no paths, executables or MAME arguments)",
                   sorted(by_name["start_session"].input_schema["properties"]) == ["ready_timeout_s", "system"])
