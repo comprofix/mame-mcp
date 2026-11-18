@@ -1,5 +1,5 @@
 {
-  "_comment": "Everyday setup: ONE entry, no MAME, PID, launch.json or run directory needed. Register with: claude mcp add mame --scope user -e \"MAMEMCP_MAME_DIR=D:\\arcade\\mame\" -e \"MAMEMCP_ROMPATH=D:\\arcade\\ROMs\\MAME 0.289 ROMs (merged)\" -- <repo>\\.venv\\Scripts\\python.exe -I -m mame_mcp.server . The game is started later, explicitly, with the start_session tool. Optional: MAMEMCP_RUNS_DIR. This file is a reference, nothing reads it.",
+  "_comment": "Everyday setup: ONE entry, no MAME, PID, launch.json or run directory needed. Register with: claude mcp add mame --scope user -e \"MAMEMCP_MAME_DIR=D:\\arcade\\mame\" -e \"MAMEMCP_ROMPATH=D:\\arcade\\ROMs\\MAME 0.289 ROMs (merged)\" -- <repo>\\.venv\\Scripts\\python.exe -I -m mame_mcp.server . The game is started later, explicitly, with the start_session tool. Optional: MAMEMCP_RUNS_DIR. The checkpoint / write_memory / input tools need no extra configuration (their files live in each session's run directory; MAMEMCP_STATE_DIR is set by the launcher and any ambient value is ignored). After updating the server, restart Claude Code or reconnect the server with /mcp so the new tools are listed. This file is a reference, nothing reads it.",
   "mcpServers": {
     "mame": {
       "type": "stdio",

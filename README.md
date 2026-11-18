@@ -117,8 +117,17 @@ Client configuration snippets: [docs/mcp-client-config.example.json](docs/mcp-cl
 | `experiment_status(experiment_id?)` | progress, reason, counts (captured / observed / dropped), errors, cleanup, last 5 events, evidence paths |
 | `cancel_experiment(experiment_id)` | removes only that experiment's breakpoint, verifies, finalises evidence |
 | `execution_control(action)` | `pause` / `resume` only (needed to leave the initial debugger stop) |
+| `list_inputs(include_unsupported=false)` | the machine's actual input ports and fields (port tag, field name, class, player, mask, current value); only plain digital fields are pressable, the rest are listed as unsupported on request |
+| `press_inputs(inputs, frames, wait=true, max_wait_s?)` | hold 1..8 distinct `{port, field}` digital inputs for 1..600 **emulated** frames, then release. Frames elapse only while emulation runs: made while paused/stopped the press is armed and held until the resume (blocking other state changes) and the call returns at once. Released on completion, `release_inputs`, `stop_session`, server shutdown, a bridge error during the wait and client disconnect |
+| `release_inputs()` | release anything held (idempotent) |
+| `save_checkpoint(label?)` | save the machine state to a session-owned file; returns a checkpoint id. Requires paused/debugger-stopped execution, no active capture, no unresolved instrumentation, no held input; machines MAME reports as not supporting save states are refused. Complete only once the file exists, has the right size and a valid MAME header for this machine |
+| `load_checkpoint(checkpoint_id)` | restore a checkpoint from this or an earlier session (same machine and MAME version; SHA-256 checked first). Complete only after frame, CPU registers and the RAM-share digest match the save-time fingerprint (`verification`). Same preconditions as save. Experiment ids from before the load become stale (`experiment_stale_after_load`); evidence files stay on disk |
+| `list_checkpoints(include_previous_sessions=true)` | checkpoints of this session and (default) earlier sessions, from their metadata |
+| `write_memory(cpu, space, address, value, width)` | ONE explicit write (width 1/2/4 bytes, all fields required) to plain RAM in the CPU's declared address map; ROM, unmapped, I/O and device-handled targets are refused. Requires paused/debugger-stopped execution and the same idle preconditions as a checkpoint. Read back; reports before / requested / actual; a mismatch is rolled back and reported |
 
-Deliberately absent: Lua evaluation, shell, general debugger-command tool, arbitrary executable / MAME-argument parameters.
+The state-changing tools (`press_inputs`, `release_inputs`, `save_checkpoint`, `load_checkpoint`, `write_memory`) work on a **managed** session only. They are serialised against each other and against `stop_session` (`operation_in_progress` if another is running).
+
+Deliberately absent: Lua evaluation, shell, general debugger-command tool, arbitrary executable / MAME-argument parameters, bank-select and any write other than the typed, RAM-only `write_memory`.
 
 ### Reproducible example experiment
 
@@ -133,7 +142,7 @@ Evidence: `runs\example\run\evidence\exp-*\{manifest.json,events.jsonl}`.
 ## Tests and validation
 
 ```powershell
-.\.venv\Scripts\python -m pytest -q                              # 97 unit tests (fake sockets / process / process table; NOT MAME evidence), incl. session lifecycle and ownership
+.\.venv\Scripts\python -m pytest -q                              # 163 unit tests (fake sockets / process / process table; NOT MAME evidence), incl. session lifecycle and ownership
 .\.venv\Scripts\python -I scripts\validate.py                    # 51 regression checks vs real MAME (Shinobi)
 .\.venv\Scripts\python -I scripts\validate_hardening.py          # 100 checks: temp ownership, execution-state matrix, Z80 (incl. hit-time register observation), read semantics
 .\.venv\Scripts\python -I scripts\validate_latency.py --gaps 1,6,12 --reps 2   # debugger-stopped latency (measured), stale replies, retries
@@ -144,6 +153,8 @@ Evidence: `runs\example\run\evidence\exp-*\{manifest.json,events.jsonl}`.
 .\.venv\Scripts\python -I scripts\mcp_bank_e2e.py                # 8 checks: bank-switch example through the MCP client
 .\.venv\Scripts\python -I scripts\validate_multi.py             # 67 checks: multi-address capture (1942 Z80 + Shinobi 68000), unequal rates, cleanup-failure/recovery (test-only hooks)
 .\.venv\Scripts\python -I scripts\mcp_multi_e2e.py              # 11 checks: multi-address capture through the MCP client (manifest structure asserted)
+.\.venv\Scripts\python -I scripts\validate_checkpoint_input.py   # 48 checks: inputs / RAM writes / checkpoints / guards / scheduled path / unresolved instrumentation / unsupported machine (real MAME + test-only observer)
+.\.venv\Scripts\python -I scripts\mcp_checkpoint_e2e.py         # 38 checks: start -> input -> save -> change -> load -> verify -> capture -> stop, through the official MCP SDK client
 ```
 Results: `runs\<suite>\results.json` (banked runs: `runs\banked`, `runs\mcp_bank_e2e`). Each script launches and kills only its own isolated MAME
 (distinct ports 9433/9441/9451/9452/9453/9455/9457/9459/9461/9463-9465/9475).
@@ -169,6 +180,10 @@ See [docs/VALIDATION.md](docs/VALIDATION.md) for what passed, what is a limitati
   `read_memory` always follows the bank selected at the time of the read (`bank_context=true` reports the selected entries, atomic with that read). Capture memory fields are read **at the hit**
   and follow the bank selected then; a capture event carries **no** bank id (the debugger cannot read one at the hit, and a bank sampled later would describe a different moment). A breakpoint matches the logical
   address whatever bank is selected. Machine-specific bank mapping lives in test profiles (`tests/fixtures/profiles/1942.json`), never in the server. Validated on one machine only (1942, Z80); see the validation report.
+* **Checkpoints, writes and inputs (managed sessions only):** MAME starts stopped in the debugger, so a checkpoint, a RAM write or an armed press can be made straight after `start_session`; while emulation *runs* save, load and write are refused (`execution_running`) - pause first (`execution_control pause`).
+  Save/load use MAME's synchronous debugger state commands and then verify independently (state-file header; frame counter, CPU registers and a digest of MAME's memory shares after a load). If MAME cannot save at that instant the plugin falls back to MAME's scheduled save/load, which runs emulation briefly: the result says `mode: "scheduled"` and `fingerprint_exact: false` (frame window).
+  State files and metadata live in the session's run directory (`home\sta\<system>\<id>.sta`, `checkpoints\<id>.json`); a checkpoint id is `<run_id>-cpNNN` and loads in a later session of the same machine and MAME version (the earlier run directory must still exist). A load changes the machine under any recorded experiment, so older experiment ids are refused as stale.
+  A checkpoint, write or press is refused while a capture is active or instrumentation is unresolved. `write_memory` classifies the target from the CPU's declared address map and refuses anything that is not plain RAM; the read-back is the final check. Inputs are counted in emulated frames from the emulator's own frame notifier; the machine sees the press for exactly the requested frames (validated against an independent per-frame port watcher). Machine-specific addresses and input names are never in the server; they live in `tests/fixtures/profiles/`.
 * **Timestamps:** event time fields are harvest-time observations (not hit-time); hit order comes from exact sequence numbers; nothing is instruction-accurate.
 * **Multi-address capture:** one experiment can watch up to 8 breakpoint locations on **one explicitly named CPU** (still one active experiment; no multi-CPU experiments).
   Example MCP arguments:
