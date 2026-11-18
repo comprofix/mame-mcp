@@ -36,7 +36,7 @@ from mame_mcp.protocol import BridgeError, capture_args, read_memory_args  # noq
 
 OUT = PROJECT_ROOT / "runs" / "banked"
 PORT, PORT_B = 9451, 9452
-ROMS = Path(r"D:\arcade\ROMs\MAME 0.289 ROMs (merged)")  # read only; the ROM collection is never modified
+ROMS = Path(r"D:\arcade\mame\roms")  # read only; the ROM collection is never modified
 PROFILE = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "1942.json").read_text())
 MAIN, AUD = PROFILE["maincpu"], PROFILE["audiocpu"]
 H = lambda s: int(s, 16)  # noqa: E731

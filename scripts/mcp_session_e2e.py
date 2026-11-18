@@ -35,7 +35,7 @@ from mame_mcp import winwake  # noqa: E402
 from mame_mcp.launcher import PROJECT_ROOT, launch  # noqa: E402
 
 MAME_DIR = r"D:\arcade\mame"
-ROMPATH = r"D:\arcade\ROMs\MAME 0.289 ROMs (merged)"
+ROMPATH = r"D:\arcade\mame\roms"
 OUT = PROJECT_ROOT / "runs" / "mcp_session_e2e"
 UNRELATED_PORT = 9481
 HANDLER = 0x404  # the validated Shinobi fixture address (68000 level-4 autovector handler), as in example_experiment.py

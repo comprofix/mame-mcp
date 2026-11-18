@@ -8,7 +8,9 @@ test hooks. This is HARNESS evidence; a later live Claude Code run is a separate
   D  input: discovery, bounded press released after its duration, running/stopped semantics, unsupported types, release on stop
   E  guards: an active capture refuses save/load/write; stale experiment ids after a load
   F  cross-session: a checkpoint saved in one session loads in the next session of the same machine
-  G  normal server shutdown releases a held input and stops the owned MAME
+  H  1944 (parent set): a device with an address space but no state interface (:qsound) through the production server:
+     session_info, save, advance, load, RAM mutation restored by load, coverage reported
+  G  normal server shutdown releases a held input and stops the owned MAME (run on the 1944 session)
 Machine-specific addresses and inputs come from tests/fixtures/profiles/shinobi.json ("checkpoint_input").
 Writes runs/mcp_checkpoint_e2e/results.json.   Usage: .venv\\Scripts\\python -I scripts\\mcp_checkpoint_e2e.py
 """
@@ -33,10 +35,11 @@ from mame_mcp import winwake  # noqa: E402
 from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 
 MAME_DIR = r"D:\arcade\mame"
-ROMPATH = r"D:\arcade\ROMs\MAME 0.289 ROMs (merged)"
+ROMPATH = r"D:\arcade\mame\roms"
 OUT = PROJECT_ROOT / "runs" / "mcp_checkpoint_e2e"
 PROFILE = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "shinobi.json").read_text())
 CI = PROFILE["checkpoint_input"]
+P1944 = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "1944.json").read_text())
 MAIN = PROFILE["maincpu"]["tag"]
 HANDLER = int(PROFILE["maincpu"]["handler_pc"], 16)
 H = lambda s: int(s, 16)  # noqa: E731
@@ -139,8 +142,13 @@ async def main() -> int:
         await asyncio.sleep(1.0)
         t0 = time.time()
         pr = await call(s, "press_inputs", inputs=PRESS, frames=20)
+        # release_verified is set by the first emulated frame AFTER the release, which can land just after the call returns
+        end_v = time.monotonic() + 5
+        while pr.get("release_verified") is None and time.monotonic() < end_v:
+            pr = {**pr, **(await call(s, "session_info")).get("input", {})}
+            await asyncio.sleep(0.1)
         check("B press_inputs(20 frames) waits and returns released; the machine saw exactly 20 frames; release verified", pr.get("state") == "released" and pr["frames_elapsed"] == 20 and pr["frames_observed_pressed"] == 20
-              and pr["release_verified"] is True and pr["waited"] is True, seconds=round(time.time() - t0, 2), result={k: pr.get(k) for k in ("state", "frames_requested", "frames_elapsed", "frames_observed_pressed", "release_verified", "end_reason")}, error=pr.get("_error"))
+              and pr.get("release_verified") is True and pr["waited"] is True, seconds=round(time.time() - t0, 2), result={k: pr.get(k) for k in ("state", "frames_requested", "frames_elapsed", "frames_observed_pressed", "release_verified", "end_reason")}, error=pr.get("_error"))
         await pause(s)
         base_frame = (await call(s, "session_info"))["clock"]["frame"]
         wr0 = await call(s, "write_memory", cpu=MAIN, space="program", address=RAM, value=0x5A, width=1)
@@ -151,6 +159,9 @@ async def main() -> int:
         check("B save_checkpoint: completed only with a real MAME state file under the session run dir; id returned; execution unchanged (paused)", sv.get("state") == "completed" and sf.is_file()
               and sf.read_bytes()[:8] == b"MAMESAVE" and sf.stat().st_size == sv["size_bytes"] and str(sf.resolve()).startswith(str(Path(r1["run_dir"]).resolve())) and sv["execution"]["state"] == "paused"
               and bool(cid), checkpoint_id=cid, mode=sv.get("mode"), size=sv.get("size_bytes"), frame=sv.get("frame"), error=sv.get("_error"))
+        cv = sv.get("fingerprint_coverage") or {}
+        check("B save reports what its fingerprint covers: registers compared on every Shinobi CPU, no device lacking a state interface, and the not-whole-machine caveat", {d["device"] for d in cv.get("registers_compared_on", [])} == set(CI["coverage"]["registers_on"])
+              and cv.get("no_state_interface") == [] and "not a whole-machine equality" in cv.get("not_covered", ""), coverage={k: cv.get(k) for k in ("registers_compared_on", "no_state_interface", "ram")})
         check("B the checkpoint records machine, MAME version, SHA-256, frame, label", sv.get("system") == "shinobi" and sv.get("mame_version", "").startswith("0.289") and len(sv.get("sha256", "")) == 64
               and sv.get("frame") == base_frame and sv.get("label") == "after input, RAM=5A", system=sv.get("system"), version=sv.get("mame_version"), frame=sv.get("frame"), base_frame=base_frame)
         # change state: RAM and emulated time
@@ -168,6 +179,9 @@ async def main() -> int:
         check("B load_checkpoint: completed only after verification; the frame counter and RAM are back to the saved values; still paused; session identity unchanged", ld.get("state") == "completed"
               and v.get("exact") is True and v.get("load_effect_observed") is True and after_frame == base_frame and v_after == "5a" and ld["execution"]["state"] == "paused" and ld["session_id"] == sid1,
               verification=v, frame_after=after_frame, ram_after=v_after, error=ld.get("_error"))
+        lcv = v.get("coverage") or {}
+        check("B the load verification reports the same coverage as the save (comparable fingerprints)", lcv.get("registers_compared_on") == cv.get("registers_compared_on") and lcv.get("no_state_interface") == cv.get("no_state_interface"),
+              load=lcv.get("registers_compared_on"), save=cv.get("registers_compared_on"))
         check("B the load bumped the state epoch (stale refs)", ld.get("state_epoch") == 1, state_epoch=ld.get("state_epoch"))
         await run(s)
         cap = await call(s, "capture_breakpoint", cpu=MAIN, address=HANDLER, max_events=20, max_wall_seconds=60, registers=["D0", "SR"], label="after-restore")
@@ -286,20 +300,67 @@ async def main() -> int:
         ld4 = await call(s, "load_checkpoint", checkpoint_id=tampered["checkpoint_id"])
         check("F a modified checkpoint file is refused (SHA-256) before the machine is touched", code_of(ld4) == "checkpoint_corrupt", code=code_of(ld4))
 
-        # ---- G: server shutdown while an input is held ---------------------------------------------------------
+        # ---- H: 1944 through the production server -------------------------------------------------------------------------------
+        await call(s, "stop_session")  # ends the Shinobi session of F
+        t_h = time.monotonic()
+        r3 = await call(s, "start_session", system="1944", ready_timeout_s=120)
+        pids.append(r3.get("pid"))
+        si3 = await until(s, lambda x: bool(x.get("cpus")), timeout=90)  # devices listed = the machine has finished loading (wall clock)
+        nq = P1944["device_without_state_interface"]["tag"]
+        dev3 = {d["tag"]: d for d in si3.get("cpus", [])}
+        check("H start_session(1944): the parent set, MAME 0.289, debugger available, no test hooks, no unresolved instrumentation; the device without a state interface is reported as such (no Lua error text)",
+              r3.get("state") == "ready" and r3["machine"]["name"] == "1944" and r3["machine"]["description"] == P1944["description"] and r3["machine"]["parent"] == "0" and r3["mame_version"].startswith("0.289")
+              and si3["test_hooks"] == [] and si3["unresolved_instrumentation"] == [] and si3["bridge"]["debugger_available"] is True and dev3[nq]["state_interface"] == "absent" and dev3[nq]["register_count"] == 0
+              and "attempt to index" not in json.dumps(si3), seconds=round(time.monotonic() - t_h, 1), romset=r3.get("romset"), qsound={k: dev3.get(nq, {}).get(k) for k in ("state_interface", "register_count", "breakpoints")}, error=r3.get("_error"))
+        e_q = await call(s, "read_registers", cpu=nq)
+        check("H read_registers on the device without a state interface is refused as no_state_interface", code_of(e_q) == "no_state_interface", code=code_of(e_q))
         await run(s)
-        await call(s, "press_inputs", inputs=PRESS, frames=600, wait=False)
+        await asyncio.sleep(3.0)
+        await pause(s)
+        f_save = (await call(s, "session_info"))["clock"]["frame"]
+        sv3 = await call(s, "save_checkpoint", label="1944 harness")
+        cov3 = sv3.get("fingerprint_coverage") or {}
+        check("H save_checkpoint while paused completes on 1944 (was internal_error): immediate, exact fingerprint, :qsound recorded as not covered, both CPUs covered", sv3.get("state") == "completed" and sv3.get("mode") == "immediate"
+              and sv3.get("fingerprint_exact") is True and cov3.get("no_state_interface") == [nq] and {d["device"] for d in cov3.get("registers_compared_on", [])} == set(P1944["devices_with_registers"]) and sv3.get("frame") == f_save,
+              checkpoint=sv3.get("checkpoint_id"), coverage={k: cov3.get(k) for k in ("registers_compared_on", "no_state_interface", "state_read_error", "registers_excluded", "ram")}, error=sv3.get("_error"))
+        await run(s)
+        await asyncio.sleep(2.0)
+        await pause(s)
+        f_adv = (await call(s, "session_info"))["clock"]["frame"]
+        ld5 = await call(s, "load_checkpoint", checkpoint_id=sv3["checkpoint_id"])
+        v5 = ld5.get("verification", {})
+        check("H after advancing, load_checkpoint verifies exactly: frame back to the checkpoint's, registers compared on both CPUs, same coverage as the save; paused", ld5.get("state") == "completed" and v5.get("exact") is True
+              and v5.get("frame_after_load") == f_save and f_adv > f_save and v5.get("registers_compared", 0) > 0 and v5.get("coverage", {}).get("no_state_interface") == [nq]
+              and v5["coverage"]["registers_compared_on"] == cov3["registers_compared_on"] and ld5["execution"]["state"] == "paused", frame_before=f_adv, verification={k: v5.get(k) for k in ("method", "exact", "frame_after_load", "registers_compared", "load_effect_observed")}, error=ld5.get("_error"))
+        ram, ramval = H(P1944["ram"]["address"]), H(P1944["ram"]["value"])
+        orig3 = await rd(s, ram)
+        wr3 = await call(s, "write_memory", cpu=MAIN, space="program", address=ram, value=ramval, width=1)
+        back3 = await rd(s, ram)
+        ld6 = await call(s, "load_checkpoint", checkpoint_id=sv3["checkpoint_id"])
+        again3 = await rd(s, ram)
+        check("H RAM mutation (no emulation between the write and the load): tool-classified plain RAM, before/requested/actual reported, independent read agrees; the load restores the original byte", wr3.get("verified") is True
+              and back3 == f"{ramval:02x}" and again3 == orig3 and ld6.get("state") == "completed" and ld6["verification"]["exact"] is True, original=orig3, written=back3, restored=again3, error=wr3.get("_error"))
+        pids_g = pids[-1]
+        await run(s)
+        PRESS_G = [{"port": ":IN0", "field": "P1 Button 1"}]
+        li3 = await call(s, "list_inputs")
+        have = {(p_["tag"], f["field"]) for p_ in li3["ports"] for f in p_["fields"]}
+        check("H list_inputs on 1944 discovers the machine's own fields (not Shinobi's names)", (":IN0", "P1 Button 1") in have and (":IN2", "Coin 1") in have and (":IN2", "1 Player Start") in have and (":P1", "P1 Button 1") not in have,
+              fields=sorted(have)[:8])
+
+        # ---- G: server shutdown while an input is held (the 1944 session is running) ---------------------------------------
+        await call(s, "press_inputs", inputs=PRESS_G, frames=600, wait=False)
         await asyncio.sleep(0.4)
-        note("G closing the MCP connection (stdin) with a held input", pid=pids[1])
+        note("G closing the MCP connection (stdin) with a held input", pid=pids[-1])
     # the `async with` above closed stdin: the server shuts down normally
     gone = False
     end = time.time() + 20
     while time.time() < end:
-        if not winwake.process_image(pids[1]):
+        if not winwake.process_image(pids[-1]):
             gone = True
             break
         await asyncio.sleep(0.3)
-    check("G normal server shutdown stops its owned MAME (held input released first by the teardown)", gone, pid=pids[1])
+    check("G normal server shutdown stops its owned MAME (held input released first by the teardown)", gone, pid=pids[-1])
     return R.save(OUT / "results.json")
 
 

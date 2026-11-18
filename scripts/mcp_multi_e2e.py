@@ -21,7 +21,7 @@ from mame_mcp.launcher import PROJECT_ROOT, launch
 
 PORT = 9461
 OUT = PROJECT_ROOT / "runs" / "mcp_multi_e2e"
-ROMS = Path(r"D:\arcade\ROMs\MAME 0.289 ROMs (merged)")
+ROMS = Path(r"D:\arcade\mame\roms")
 RESULTS: list[dict] = []
 
 

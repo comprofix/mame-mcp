@@ -198,6 +198,15 @@
     "unsupported_machine": {
       "system": "005",
       "note": "driver without MACHINE_SUPPORTS_SAVE (-listxml savestate=\"unsupported\")"
+    },
+    "coverage": {
+      "registers_on": [
+        ":maincpu",
+        ":soundcpu",
+        ":upd7751"
+      ],
+      "no_state_interface": [],
+      "note": "devices with address spaces on this machine; all three expose a state interface"
     }
   }
 }

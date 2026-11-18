@@ -11,8 +11,10 @@ Sections (separate MAME instances where a test hook or another machine is needed
   D  checkpoints (scheduled/deferred path, test hook MAMEMCP_TEST_FORCE_SCHEDULED_CHECKPOINT) incl. a corrupt file
   U  unresolved instrumentation (test hook MAMEMCP_TEST_FAIL_CLEAR) refuses save/load/write
   M  a machine without save-state support is refused clearly
+  S  1944 (CPS2): a device with an address space but NO state interface (:qsound) must not break session_info,
+     checkpoints or verification; coverage is reported; PC-loop investigation; RAM mutation restored by load
 Game/CPU-specific addresses and inputs come from tests/fixtures/profiles/shinobi.json ("checkpoint_input").
-Writes runs/checkpoint_input/results.json.   Usage: .venv\\Scripts\\python -I scripts\\validate_checkpoint_input.py [--sections I,W,C,G,D,U,M]
+Writes runs/checkpoint_input/results.json.   Usage: .venv\\Scripts\\python -I scripts\\validate_checkpoint_input.py [--sections I,W,C,G,D,U,M,S]
 """
 from __future__ import annotations
 
@@ -33,11 +35,13 @@ from mame_mcp.launcher import PROJECT_ROOT, launch  # noqa: E402
 from mame_mcp.protocol import BridgeError  # noqa: E402
 
 OUT = PROJECT_ROOT / "runs" / "checkpoint_input"
-# ROM set directory holding the machine without save-state support (section M); the default rompath only needs Shinobi
-ALT_ROMPATH = Path(os.environ.get("MAMEMCP_ALT_ROMPATH", "D:/arcade/ROMs/MAME 0.289 ROMs (merged)"))
+# ROM directory holding the machine without save-state support (section M); override with MAMEMCP_ALT_ROMPATH
+ALT_ROMPATH = Path(os.environ.get("MAMEMCP_ALT_ROMPATH", "D:/arcade/mame/roms"))
 PROFILE = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "shinobi.json").read_text())
+P1944 = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "1944.json").read_text())
 CI = PROFILE["checkpoint_input"]
 MAIN = PROFILE["maincpu"]["tag"]
+MAINCPU1944 = P1944["maincpu"]
 HANDLER = int(PROFILE["maincpu"]["handler_pc"], 16)
 H = lambda s: int(s, 16)  # noqa: E731
 R = Results("checkpoint_input")
@@ -55,6 +59,11 @@ class Inst:
         self.fx = Fixture(self.info["fixture_dir"], wake=wake) if fixture else None
         self.c = BridgeClient(port=port, default_timeout=30, wake=wake)
         self.c.connect(timeout=90)
+        # The bridge can answer while MAME is still loading ROMs (session_info then lists no devices). A state-changing
+        # request in that window crashed MAME 0.289 (running_machine::resume) in testing, so wait - by WALL clock - for devices.
+        end = time.monotonic() + 120
+        while time.monotonic() < end and not self.info_().get("cpus"):
+            time.sleep(0.5)
         self.sta = self.run_dir / "home" / "sta" / system
         self.n = 0
 
@@ -320,6 +329,10 @@ def section_memory_and_checkpoints(want: set[str]) -> None:
             check("C save (debugger-stopped): completed only with a valid MAME state file; immediate; execution unchanged; frame recorded", s1["state"] == "completed" and s1["mode"] == "immediate"
                   and hd["magic"] == "MAMESAVE" and hd["system"] == "shinobi" and hd["size"] == s1["size"] and s1["execution"]["state"] == "debugger_stopped" and s1["frames_run_during_operation"] == 0
                   and s1["fingerprint"]["exact"] is True and s1["fingerprint"]["frame"] == fp_probe["clock"]["frame"], header=hd, frame=s1["frame"], fp_ram=s1["fingerprint"].get("ram"), execution=s1["execution"]["state"])
+            cv = s1["fingerprint_coverage"]
+            check("C Shinobi coverage is reported: registers compared on its three CPUs, no device with spaces lacks a state interface, nothing excluded, RAM-share digest coverage stated",
+                  {d["device"] for d in cv["registers_compared_on"]} == set(CI["coverage"]["registers_on"]) and cv["no_state_interface"] == CI["coverage"]["no_state_interface"] and cv["state_read_error"] == []
+                  and cv["registers_excluded"] == [] and set(s1["fingerprint"]["devices"]) == set(CI["coverage"]["registers_on"]), coverage={k: cv[k] for k in ("registers_compared_on", "no_state_interface", "ram")})
             dup = m.err("checkpoint_save", {"id": s1["id"]})
             check("C checkpoint ids are never overwritten", code(dup) == "checkpoint_exists", code=code(dup))
             wm(ram, 0x77, 1)
@@ -457,6 +470,126 @@ def section_deferred() -> None:
         m.close()
 
 
+# ------------------------------------------------------------------------------------------------------------------ S
+def section_1944() -> None:
+    """Regression for the 1944 defect: `:qsound` (qsound_hle) has an address space but no state (and no debug) interface, so the
+    fingerprint and session_info iterated a nil `state`. Real MAME 0.289, production plugin only (no fixture plugin)."""
+    wall0 = time.monotonic()
+    m = Inst("s1944", 9456, system="1944", fixture=False)
+    try:
+        note("S startup (wall clock)", seconds=round(time.monotonic() - wall0, 1))
+        nq = P1944["device_without_state_interface"]["tag"]
+        ram, ramval = H(P1944["ram"]["address"]), H(P1944["ram"]["value"])
+        si = m.info_()
+        dev = {d["tag"]: d for d in si["cpus"]}
+        raw = json.dumps(si)
+        check("S session_info lists the device without a state interface as such (no raw Lua error text), and the CPUs with their registers", nq in dev and dev[nq]["state_interface"] == "absent"
+              and dev[nq]["register_count"] == 0 and dev[nq]["breakpoints"].get("interface") == "absent"
+              and all(dev[t]["state_interface"] == "present" and dev[t]["register_count"] > 0 for t in P1944["devices_with_registers"]) and "attempt to index" not in raw and "for iterator" not in raw,
+              qsound={k: dev.get(nq, {}).get(k) for k in ("state_interface", "register_count", "breakpoints")}, cpus={t: dev[t]["register_count"] for t in P1944["devices_with_registers"]})
+        e_reg = m.err("read_registers", {"cpu": nq})
+        e_cap = m.err("capture_breakpoint", {"cpu": nq, "address": 0, "max_events": 1, "max_wall_seconds": 5, "registers": [], "memory": []})
+        e_cap2 = m.err("capture_breakpoint", {"cpu": MAINCPU1944, "address": 0x1000, "max_events": 1, "max_wall_seconds": 5, "registers": ["NOPE"], "memory": []})
+        check("S read_registers / capture on the device without interfaces are refused with specific codes (not internal_error); an unknown register is still unknown_register", code(e_reg) == "no_state_interface"
+              and code(e_cap) == "no_debug_interface" and code(e_cap2) == "unknown_register", codes=[code(e_reg), code(e_cap), code(e_cap2)])
+        regs = m.rq("read_registers", {"cpu": MAINCPU1944, "registers": ["CURPC", "SR"]}, mutating=False)
+        check("S read_registers on the CPU still works", {r["name"] for r in regs["registers"]} == {"CURPC", "SR"})
+
+        # ---- PC-loop investigation (wall-clock bounded). Replicates the live smoke test's sequence (coin, start, run on) --------
+        loop = P1944["pc_loop"]
+        lo, hi = H(loop["loop_pc_range"][0]), H(loop["loop_pc_range"][1])
+        li = m.rq("list_inputs", {"include_unsupported": False}, mutating=False)
+        by_field = {f["field"]: f["port"] for p_ in li["ports"] for f in p_["fields"]}
+        coin = {"port": by_field[loop["input_fields"]["coin"]], "field": loop["input_fields"]["coin"]}
+        start = {"port": by_field[loop["input_fields"]["start"]], "field": loop["input_fields"]["start"]}
+
+        def reach(frame, wall_s):
+            end_ = time.monotonic() + wall_s
+            while time.monotonic() < end_:
+                if m.frame() >= frame:
+                    return True
+                time.sleep(0.25)
+            return False
+
+        m.run()
+        reached_boot = reach(230, 40)
+        presses = []
+        for item in (coin, start):
+            r = m.rq("input_press", {"inputs": [item], "frames": 10})
+            end_ = time.monotonic() + 20
+            while r["state"] == "holding" and time.monotonic() < end_:
+                time.sleep(0.1)
+                r = m.rq("input_status", mutating=False)
+            presses.append({k: r.get(k) for k in ("inputs", "state", "frames_requested", "frames_elapsed", "frames_observed_pressed", "release_verified")})
+        check("S coin and start presses (fields discovered from list_inputs) complete and release - this proves nothing about the game accepting them", reached_boot and all(x["state"] == "released"
+              and x["frames_elapsed"] == 10 and x["frames_observed_pressed"] == 10 for x in presses), presses=presses)
+        reached = reach(loop["reach_frame"], 60)
+        counter_addr, flag_addr = H(loop["counter_address"]), H(loop["flag_address"])
+
+        def word(a):
+            return int(m.rq("read_memory", {"cpu": MAINCPU1944, "space": "program", "address": a, "length": 2, "mode": "inspect"}, mutating=False)["data_hex"], 16)
+
+        samples, flag = [], []
+        c0, f0 = word(counter_addr), m.frame()
+        end_ = time.monotonic() + 6.0
+        while time.monotonic() < end_ and len(samples) < 40:
+            samples.append(H(m.rq("read_registers", {"cpu": MAINCPU1944, "registers": ["CURPC"]}, mutating=False)["registers"][0]["hex"]))
+            flag.append(word(flag_addr) >> 8)
+        c1, f1 = word(counter_addr), m.frame()
+        in_loop = sum(1 for x in samples if lo <= x < hi)
+        m.pause()
+        op = m.rq("read_memory", {"cpu": MAINCPU1944, "space": "opcodes", "address": H(loop["address"]), "length": loop["length"], "mode": "inspect"}, mutating=False)["data_hex"]
+        check("S the code at the 0x7F4-area PC loop is a poll: opcodes-space bytes match TST.W $921CC4 ; BEQ back to the TST (hand-decoded; not a claim about what the game is doing)", op == loop["expected_opcodes_hex"],
+              opcodes=op, expected=loop["expected_opcodes_hex"])
+        note("S PC samples while running after the coin/start sequence", reached_frame=reached, frames=[f0, f1], samples=len(samples), in_loop_0x7EE_0x7F8=in_loop,
+             distinct_pcs=sorted({hex(x) for x in samples})[:12], flag_high_byte_values=sorted(set(flag)))
+        check("S the loop keeps being exited: the word incremented right after the poll advanced while emulation ran (so the machine is not stuck waiting in it); it does NOT show attract vs gameplay",
+              reached and ((c1 - c0) & 0xFFFF) > 0, counter=[c0, c1], frames=[f0, f1], increments_per_frame=round(((c1 - c0) & 0xFFFF) / max(1, f1 - f0), 3))
+
+        # ---- save: coverage ---------------------------------------------------------------------------------------------------
+        f_save = m.frame()
+        s1 = m.save("s1944-cp1")
+        fp = s1["fingerprint"]
+        cov = s1["fingerprint_coverage"]
+        check("S save while paused COMPLETES on 1944 (was internal_error); immediate, exact; the device without a state interface is recorded as not covered, the CPUs as covered", s1["state"] == "completed"
+              and s1["mode"] == "immediate" and fp["exact"] is True and fp["devices"][nq] == {"covered": False, "reason": "no_state_interface"} and cov["no_state_interface"] == [nq]
+              and {d["device"] for d in cov["registers_compared_on"]} == set(P1944["devices_with_registers"]) and cov["state_read_error"] == [] and cov["registers_excluded"] == [] and s1["frame"] == f_save,
+              mode=s1["mode"], devices=fp["devices"], coverage={k: cov[k] for k in ("registers_compared_on", "no_state_interface", "state_read_error", "registers_excluded")})
+        check("S the coverage text says it is not whole-machine equality, and the RAM digest reports its partial coverage instead of hiding it", "not a whole-machine equality" in cov["not_covered"] and "partial" in cov["ram"]
+              and cov["ram"]["bytes_hashed"] <= cov["ram"]["bytes_total"], ram=cov["ram"])
+
+        # ---- advance, load: restoration, comparable fingerprints -----------------------------------------------------------------
+        m.run()
+        time.sleep(2.0)
+        m.pause()
+        f_adv = m.frame()
+        ld = m.load(s1["id"], fp)
+        v = ld["verification"]
+        check("S after ~2 s of emulation, load verifies exactly on 1944: frame back to the checkpoint's, registers compared on both CPUs, load effect observed; still paused", ld["state"] == "completed" and v["exact"] is True
+              and v["frame_after_load"] == f_save and f_adv > f_save and v["load_effect_observed"] is True and v["registers_compared"] > 0 and m.state() == "paused", verification={k: v.get(k) for k in
+              ("method", "exact", "frame_before_load", "frame_after_load", "expected_frame", "registers_compared", "load_effect_observed")})
+        check("S save and load built comparable fingerprints: the load-side coverage equals the save-side coverage (same devices, same register counts, same excluded set)", v["coverage"] == {**cov, "ram": v["coverage"]["ram"]}
+              and v["coverage"]["no_state_interface"] == cov["no_state_interface"] and v["coverage"]["registers_compared_on"] == cov["registers_compared_on"], load_cov=v["coverage"]["registers_compared_on"], save_cov=cov["registers_compared_on"])
+
+        # ---- RAM mutation, never resumed, restored by load -------------------------------------------------------------------------
+        orig = int(m.rq("read_memory", {"cpu": MAINCPU1944, "space": "program", "address": ram, "length": 1, "mode": "inspect"}, mutating=False)["data_hex"], 16)
+        value = ramval if ramval != orig else (ramval ^ 0xFF)
+        wr = m.rq("write_memory", {"cpu": MAINCPU1944, "space": "program", "address": ram, "value": value, "width": 1})
+        back = int(m.rq("read_memory", {"cpu": MAINCPU1944, "space": "program", "address": ram, "length": 1, "mode": "inspect"}, mutating=False)["data_hex"], 16)
+        check("S RAM write accepted only because the tool classified the target as plain RAM; before / requested / actual reported; an independent read agrees; emulation is NOT resumed", wr["verified"] is True
+              and wr["before"]["value"] == orig and wr["requested"]["value"] == value and wr["after"]["value"] == value == back and m.state() == "paused", address=hex(ram), original=orig, written=value, read_back=back)
+        ld2 = m.load(s1["id"], fp)
+        again = int(m.rq("read_memory", {"cpu": MAINCPU1944, "space": "program", "address": ram, "length": 1, "mode": "inspect"}, mutating=False)["data_hex"], 16)
+        check("S load restores the mutated byte (independent read) with exact frame/register verification; the RAM digest is partial on this machine so the field read is the restoration evidence", ld2["state"] == "completed"
+              and ld2["verification"]["exact"] is True and again == orig and ld2["verification"]["frame_after_load"] == f_save, restored=again, original=orig, ram_digest=ld2["verification"].get("ram_digest"))
+        note("S RAM target justification", reason="no emulation ran between the write and the load, so the machine could not observe the value; mapped-RAM / zero bytes are NOT claimed to prove the location unused")
+        st = m.rq("input_status", mutating=False)
+        check("S no held input / unresolved instrumentation at the end", st["state"] in ("none", "released") and m.info_()["unresolved_instrumentation"] == [], input=st["state"])
+        note("S wall clock", seconds=round(time.monotonic() - wall0, 1))
+    finally:
+        m.close()
+
+
 # ------------------------------------------------------------------------------------------------------------------ U / M
 def section_unresolved() -> None:
     m = Inst("unresolved", 9454, test_env={"MAMEMCP_TEST_FAIL_CLEAR": "1"})
@@ -495,9 +628,9 @@ def section_unsupported_machine() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sections", default="I,W,C,G,D,U,M")
+    ap.add_argument("--sections", default="I,W,C,G,D,U,M,S")
     want = set(ap.parse_args().sections.split(","))
-    if OUT.exists() and want >= set("IWCGDUM"):
+    if OUT.exists() and want >= set("IWCGDUMS"):
         shutil.rmtree(OUT, ignore_errors=True)
     OUT.mkdir(parents=True, exist_ok=True)
     if "I" in want:
@@ -510,6 +643,8 @@ def main() -> int:
         section_unresolved()
     if "M" in want:
         section_unsupported_machine()
+    if "S" in want:
+        section_1944()
     return R.save(OUT / "results.json")
 
 

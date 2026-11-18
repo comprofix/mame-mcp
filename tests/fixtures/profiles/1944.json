@@ -1,0 +1,40 @@
+{
+  "_comment": "Machine-specific facts for the 1944 (parent set, Europe 000620) checkpoint compatibility validation on MAME 0.289. The server contains none of these. Nothing here concerns Side Fighter objects.",
+  "system": "1944",
+  "description": "1944: The Loop Master (Europe 000620)",
+  "parent": null,
+  "maincpu": ":maincpu",
+  "space": "program",
+  "device_without_state_interface": {
+    "tag": ":qsound",
+    "type": "qsound_hle",
+    "note": "has a ROM address space but no state (register) interface and no debug interface"
+  },
+  "devices_with_registers": [
+    ":maincpu",
+    ":audiocpu"
+  ],
+  "ram": {
+    "address": "0xFF0000",
+    "value": "0xA5",
+    "note": "accepted by write_memory as plain RAM in the declared map. NOT claimed unused: the mutation test never resumes emulation between the write and the load, so the machine cannot observe the changed value, and restoration is verified by independent read."
+  },
+  "pc_loop": {
+    "note": "PC observed around 0x7F4/0x7F6 while running; opcodes-space bytes read from this address (decoded by hand: TST.W $921CC4 ; BEQ back to the TST) - a poll of a flag at 0x921CC4",
+    "address": "0x7EE",
+    "length": 10,
+    "expected_opcodes_hex": "4a7900921cc46700fff8",
+    "loop_pc_range": [
+      "0x7EE",
+      "0x7F8"
+    ],
+    "flag_address": "0x921CC4",
+    "counter_address": "0x921CD0",
+    "counter_note": "ADDQ.W #1 target in the instructions after the poll (hand-decoded from opcodes space); sampled to see whether the loop keeps being exited",
+    "reach_frame": 1500,
+    "input_fields": {
+      "coin": "Coin 1",
+      "start": "1 Player Start"
+    }
+  }
+}
