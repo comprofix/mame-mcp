@@ -130,6 +130,10 @@ class OpsRig(Rig):
         return sum(1 for o, _ in self.client.calls if o == op)
 
 
+# a machine with a device that has an address space but no state interface (1944's :qsound): recorded as not covered
+COVERAGE = {"registers_compared_on": [{"device": ":maincpu", "registers": 20}, {"device": ":audiocpu", "registers": 27}], "no_state_interface": [":qsound"],
+            "state_read_error": [], "registers_excluded": [], "ram": {"partial": True, "bytes_hashed": 262144, "bytes_total": 4415628},
+            "not_covered": "device-internal state of devices without a register interface, anonymous RAM and any other state in the file are not compared; this is not a whole-machine equality check"}
 FP = {"frame": 120, "cpus": {":maincpu": {"PC": "404", "SR": "2700"}}, "exact": True}
 
 
@@ -138,6 +142,7 @@ def save_reply(rig, args, mode="immediate", fp=FP):
     return {"state": "completed", "kind": "save", "id": args["id"], "path": str(p).replace("\\", "/"), "mode": mode, "size": p.stat().st_size,
             "execution_before": "debugger_stopped", "execution": {"state": "debugger_stopped"}, "frames_run_during_operation": 0,
             "header": {"magic": "MAMESAVE", "version": 2, "system": "shinobi", "signature": "0badf00d"}, "fingerprint": fp, "frame": 120,
+            "fingerprint_coverage": COVERAGE,
             "emu_time_s": 2.0, "mame_version": "0.289"}
 
 
@@ -166,6 +171,15 @@ def test_save_checkpoint_writes_metadata_and_registers(rig):
     assert second["checkpoint_id"].endswith("-cp002")
     ls = rig.mgr.list_checkpoints()
     assert [c["checkpoint_id"] for c in ls["checkpoints"]] == [second["checkpoint_id"], cid][: len(ls["checkpoints"])] or len(ls["checkpoints"]) == 2
+
+
+def test_save_reports_and_persists_what_the_fingerprint_covers(rig):
+    out = rig.mgr.save_checkpoint("coverage")
+    assert out["fingerprint_coverage"] == COVERAGE and out["fingerprint_coverage"]["no_state_interface"] == [":qsound"]
+    side = json.loads((rig.run_dir / "checkpoints" / f"{out['checkpoint_id']}.json").read_text())
+    assert side["fingerprint_coverage"] == COVERAGE  # kept with the checkpoint, so a later session can still describe it
+    listed = rig.mgr.list_checkpoints()["checkpoints"][0]
+    assert listed["fingerprint_coverage"] == COVERAGE
 
 
 def test_save_passes_the_plugin_refusals_through_and_registers_nothing(rig):

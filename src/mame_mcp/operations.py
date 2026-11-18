@@ -140,7 +140,7 @@ class StateOperations:
                 "created_utc": _utc(), "mame_version": res.get("mame_version") or s.mame_version,
                 "frame": res.get("frame"), "emu_time_s": res.get("emu_time_s"),
                 "execution_at_save": res.get("execution_before"), "mode": res.get("mode"),
-                "fingerprint": res.get("fingerprint"), "header": res.get("header"),
+                "fingerprint": res.get("fingerprint"), "fingerprint_coverage": res.get("fingerprint_coverage"), "header": res.get("header"),
                 "file": {"name": path.name, "size": size, "sha256": digest},
             }
             side = self._sidecar(s.run_dir, cid)
@@ -177,7 +177,7 @@ class StateOperations:
             "created_utc": meta.get("created_utc"), "frame": meta.get("frame"), "emu_time_s": meta.get("emu_time_s"),
             "execution_at_save": meta.get("execution_at_save"), "size_bytes": (meta.get("file") or {}).get("size"),
             "sha256": (meta.get("file") or {}).get("sha256"), "mame_version": meta.get("mame_version"),
-            "fingerprint_exact": fp.get("exact", True),
+            "fingerprint_exact": fp.get("exact", True), "fingerprint_coverage": meta.get("fingerprint_coverage"),
             "current_session": bool(s is not None and meta.get("run_id") == s.run_id),
         }
         if meta.get("imported_from"):

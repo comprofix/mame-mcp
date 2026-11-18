@@ -139,6 +139,15 @@ function exports.startplugin()
 
 	local function machine() return manager.machine end
 
+	-- Device interface probe. MAME devices expose optional interfaces (`state` = registers, `debug` = breakpoints). A device
+	-- can have address spaces and still lack them (e.g. :qsound, a sound device with a ROM space). Returns the interface,
+	-- or nil plus a reason: error == nil means the interface is simply ABSENT; a string means reading it raised (a real error).
+	local function iface(dev, field)
+		local ok, v = pcall(function() return dev[field] end)
+		if not ok then return nil, tostring(v) end
+		return v, nil
+	end
+
 	local function exec_state()
 		local m = machine()
 		local dbg = m.debugger
@@ -246,7 +255,10 @@ function exports.startplugin()
 	-- breakpoints currently installed on a cpu, flagged when owned by an experiment of this bridge
 	local function list_breakpoints(dev, tag)
 		local out = {}
-		local ok, list = pcall(function() return dev.debug:bplist() end)
+		local dbgi, dberr = iface(dev, "debug")
+		if dberr then return { unavailable = true, reason = "debug interface read failed: " .. dberr } end
+		if not dbgi then return { unavailable = true, reason = "device has no debug interface (it cannot hold breakpoints)", interface = "absent" } end
+		local ok, list = pcall(function() return dbgi:bplist() end)
 		if not ok then return { unavailable = true, reason = tostring(list) } end
 		local owned = {}
 		for _, id in ipairs(order) do
@@ -277,14 +289,24 @@ function exports.startplugin()
 			local has_spaces = false
 			for _ in pairs(dev.spaces) do has_spaces = true break end
 			if has_spaces then
-				devices[#devices + 1] = {
+				local st, sterr = iface(dev, "state")
+				local entry = {
 					tag = tag,
 					type = try(function() return dev.shortname end),
 					name = try(function() return dev.name end),
 					address_spaces = list_spaces(dev),
-					register_count = try(function() local n = 0 for _ in pairs(dev.state) do n = n + 1 end return n end),
+					state_interface = (st ~= nil) and "present" or (sterr and "read_error" or "absent"),
 					breakpoints = machine().debugger and list_breakpoints(dev, tag) or { unavailable = true, reason = "no debugger (start MAME with -debug)" },
 				}
+				if st then
+					entry.register_count = try(function() local n = 0 for _ in pairs(st) do n = n + 1 end return n end)
+				elseif sterr then
+					entry.register_count = { unavailable = true, reason = "state interface read failed: " .. sterr }
+				else
+					entry.register_count = 0
+					entry.registers_note = "device has address spaces but no state (register) interface: no registers to read or verify"
+				end
+				devices[#devices + 1] = entry
 			end
 		end
 		table.sort(devices, function(a, b) return a.tag < b.tag end)
@@ -433,10 +455,10 @@ function exports.startplugin()
 		return info
 	end
 
-	local function register_entry(dev, name)
-		local st = dev.state[name]
-		if not st then return nil end
-		local value = st.value
+	local function register_entry(st, name)
+		local reg = st[name]
+		if not reg then return nil end
+		local value = reg.value
 		return {
 			name = name,
 			hex = string.format("0x%X", value),
@@ -447,24 +469,29 @@ function exports.startplugin()
 	function ops.read_registers(args)
 		local dev, err = find_cpu(args.cpu)
 		if not dev then return nil, err end
+		local st, sterr = iface(dev, "state")
+		if sterr then return fail("state_read_error", args.cpu .. ": reading its state interface failed: " .. sterr) end
+		if not st then
+			return fail("no_state_interface", args.cpu .. " has address spaces but no state (register) interface, so it has no registers; use read_memory for its address spaces")
+		end
 		local names = {}
 		if args.registers ~= nil then
 			if type(args.registers) ~= "table" then return fail("bad_argument", "registers must be a list of names") end
 			for _, n in ipairs(args.registers) do
 				if not valid_ident(n) then return fail("bad_argument", "invalid register name") end
-				if not dev.state[n] then return fail("unknown_register", "cpu " .. args.cpu .. " has no register " .. n) end
+				if not st[n] then return fail("unknown_register", "cpu " .. args.cpu .. " has no register " .. n) end
 				names[#names + 1] = n
 			end
 			if #names > LIMITS.max_registers then return fail("too_large", "too many registers requested") end
 		else
-			for n in pairs(dev.state) do names[#names + 1] = n end
+			for n in pairs(st) do names[#names + 1] = n end
 			table.sort(names)
 			if #names > LIMITS.max_registers then
 				return fail("too_large", "cpu exposes " .. #names .. " registers; name the ones you want")
 			end
 		end
 		local out = {}
-		for _, n in ipairs(names) do out[#out + 1] = register_entry(dev, n) end
+		for _, n in ipairs(names) do out[#out + 1] = register_entry(st, n) end
 		return {
 			cpu = args.cpu, registers = out,
 			numeric_format = "hex is unsigned, '0x'-prefixed; dec is an unsigned decimal string (no float rounding)",
@@ -569,6 +596,9 @@ function exports.startplugin()
 			return fail("debugger_unavailable", "MAME was started without -debug; breakpoints are unavailable")
 		end
 		if active then return fail("experiment_active", "experiment " .. active.id .. " is still running") end
+		local dbgi, dberr = iface(dev, "debug")
+		if dberr then return fail("debug_interface_error", args.cpu .. ": reading its debug interface failed: " .. dberr) end
+		if not dbgi then return fail("no_debug_interface", args.cpu .. " has no debug interface, so breakpoints cannot be set on it") end
 		local space = dev.spaces["program"]
 		if not space then return fail("unknown_space", "cpu has no program space") end
 		-- Locations: either one legacy `address`, or 1..max_locations {address, id} on this one CPU.
@@ -612,11 +642,17 @@ function exports.startplugin()
 			return fail("bad_argument", "max_wall_seconds must be a number in (0, " .. LIMITS.max_wall_seconds .. "]")
 		end
 		local regs = {}
+		local cst, csterr
+		if args.registers ~= nil and #args.registers > 0 then
+			cst, csterr = iface(dev, "state")
+			if csterr then return fail("state_read_error", args.cpu .. ": reading its state interface failed: " .. csterr) end
+			if not cst then return fail("no_state_interface", args.cpu .. " has no state (register) interface; capture it without registers") end
+		end
 		for _, n in ipairs(args.registers or {}) do
-			if not valid_ident(n) or not dev.state[n] then
+			if not valid_ident(n) or not cst[n] then
 				return fail("unknown_register", "register '" .. tostring(n) .. "' is not a state entry of this cpu")
 			end
-			local ok, sym = pcall(function() return dev.state[n].symbol end)
+			local ok, sym = pcall(function() return cst[n].symbol end)
 			if not ok or type(sym) ~= "string" or sym == "" or not valid_ident(sym) then
 				return fail("unknown_register", "register '" .. n .. "' has no debugger-expression symbol")
 			end
@@ -1650,27 +1686,68 @@ function exports.startplugin()
 		return { digest = string.format("%08x", h), shares = #tags, bytes_hashed = hashed, bytes_total = total, partial = partial }
 	end
 
-	-- Frame counter + every CPU's registers + a RAM digest, except the debugger's derived CUR* pseudo-registers (CURFLAGS
-	-- differed across an identical save/load on the Z80 in testing; CURPC is redundant with PC).
+	-- Frame counter + register values of every device that HAS a state interface + a RAM-share digest, except the debugger's
+	-- derived CUR* pseudo-registers (CURFLAGS differed across an identical save/load on the Z80 in testing; CURPC is redundant
+	-- with PC). Coverage is recorded, not assumed: `devices[tag]` says for every device with address spaces whether its
+	-- registers are covered, absent (no state interface: nothing to compare) or failed to read, and which registers were
+	-- excluded and why. This is NOT whole-machine equality: device-internal state without a register interface, anonymous
+	-- RAM and everything else the state file holds is outside what is compared.
 	local function fingerprint()
-		local fp = { frame = frame_now() or -1, cpus = {}, exact = true }
+		local fp = { frame = frame_now() or -1, cpus = {}, devices = {}, exact = true }
 		for tag, dev in pairs(machine().devices) do
 			local has = false
 			for _ in pairs(dev.spaces) do has = true break end
 			if has then
-				local regs = {}
-				for name, st in pairs(dev.state) do
-					if not name:match("^CUR") then
-						local ok, v = pcall(function() return st.value end)
-						if ok and math.type(v) == "integer" then regs[name] = string.format("%X", v) end
+				local st, sterr = iface(dev, "state")
+				if sterr then
+					fp.devices[tag] = { covered = false, reason = "state_read_error", error = sterr }
+				elseif not st then
+					fp.devices[tag] = { covered = false, reason = "no_state_interface" }
+				else
+					local regs, nregs, excluded, nexcl = {}, 0, {}, 0
+					for name, reg in pairs(st) do
+						if not name:match("^CUR") then
+							local ok, v = pcall(function() return reg.value end)
+							if ok and math.type(v) == "integer" then
+								regs[name] = string.format("%X", v)
+								nregs = nregs + 1
+							else
+								nexcl = nexcl + 1
+								if #excluded < 16 then
+									excluded[#excluded + 1] = { name = name, reason = ok and "non_integer_value" or "read_error", error = (not ok) and tostring(v) or nil }
+								end
+							end
+						end
 					end
+					fp.cpus[tag] = regs
+					fp.devices[tag] = { covered = true, registers = nregs }
+					if nexcl > 0 then fp.devices[tag].excluded_count, fp.devices[tag].excluded = nexcl, excluded end
 				end
-				fp.cpus[tag] = regs
 			end
 		end
 		local okr, ram = pcall(ram_digest)
-		if okr then fp.ram = ram end
+		if okr then fp.ram = ram else fp.ram_error = tostring(ram) end
 		return fp
+	end
+
+	-- What a fingerprint covers and what it does not, from the fingerprint itself (so save and load describe the same thing).
+	local function fingerprint_coverage(fp)
+		local c = { registers_compared_on = {}, no_state_interface = {}, state_read_error = {}, registers_excluded = {} }
+		for _, tag in ipairs(sorted_keys(fp.devices or {})) do
+			local d = fp.devices[tag]
+			if d.covered then
+				c.registers_compared_on[#c.registers_compared_on + 1] = { device = tag, registers = d.registers }
+				if d.excluded_count then c.registers_excluded[#c.registers_excluded + 1] = { device = tag, count = d.excluded_count, examples = d.excluded } end
+			elseif d.reason == "no_state_interface" then
+				c.no_state_interface[#c.no_state_interface + 1] = tag
+			else
+				c.state_read_error[#c.state_read_error + 1] = { device = tag, error = d.error }
+			end
+		end
+		c.ram = fp.ram and { kind = "memory shares (RAM pools MAME exposes by tag)", shares = fp.ram.shares, bytes_hashed = fp.ram.bytes_hashed,
+			bytes_total = fp.ram.bytes_total, partial = fp.ram.partial } or { unavailable = true, error = fp.ram_error }
+		c.not_covered = "device-internal state of devices without a register interface, anonymous RAM and any other state in the file are not compared; this is not a whole-machine equality check"
+		return c
 	end
 
 	local function fingerprint_diff(expect, got)
@@ -1678,6 +1755,19 @@ function exports.startplugin()
 		if expect.frame ~= got.frame then d[#d + 1] = string.format("frame %s != %s", tostring(expect.frame), tostring(got.frame)) end
 		if expect.ram and got.ram and expect.ram.digest ~= got.ram.digest then
 			d[#d + 1] = string.format("ram digest %s != %s", tostring(expect.ram.digest), tostring(got.ram.digest))
+		elseif (expect.ram ~= nil) ~= (got.ram ~= nil) then
+			d[#d + 1] = "ram digest available on only one side (" .. tostring(expect.ram_error or got.ram_error) .. ")"
+		end
+		-- Coverage must match: a checkpoint is only verified against a fingerprint built the same way. (Fingerprints from
+		-- before this field existed carry no `devices` and are compared on registers only.)
+		if expect.devices then
+			for tag, e in pairs(expect.devices) do
+				local g = (got.devices or {})[tag]
+				if not g then d[#d + 1] = tag .. " coverage missing after load"
+				elseif e.covered ~= g.covered or e.registers ~= g.registers then
+					d[#d + 1] = string.format("%s coverage differs (%s/%s regs vs %s/%s regs)", tag, tostring(e.covered), tostring(e.registers), tostring(g.covered), tostring(g.registers))
+				end
+			end
 		end
 		local n = 0
 		for tag, regs in pairs(expect.cpus or {}) do
@@ -1753,7 +1843,7 @@ function exports.startplugin()
 	local function finish_save(rec, hd)
 		local r = ckpt_result(rec, {
 			size = hd.size, header = { magic = hd.magic, version = hd.version, system = hd.system, signature = hd.signature },
-			fingerprint = rec.fp, frame = rec.fp.frame, emu_time_s = rec.saved_clock and rec.saved_clock.emu_time_s or nil,
+			fingerprint = rec.fp, fingerprint_coverage = fingerprint_coverage(rec.fp), frame = rec.fp.frame, emu_time_s = rec.saved_clock and rec.saved_clock.emu_time_s or nil,
 			state_machine = machine().system.name, mame_version = emu.app_version(),
 		})
 		return r
@@ -1780,6 +1870,7 @@ function exports.startplugin()
 				expected_frame = rec.expect.frame, frame_before_load = rec.pre_fp.frame, frame_after_load = post.frame,
 				registers_compared = nregs, ignored = "debugger-derived CUR* pseudo-registers",
 				ram_digest = exact and post.ram or nil,
+				coverage = fingerprint_coverage(post),
 				ram_coverage = "memory shares only (RAM pools MAME exposes by tag); anonymous RAM is not covered",
 			},
 			invalidated_experiments = invalid,
