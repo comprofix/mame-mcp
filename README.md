@@ -142,7 +142,7 @@ Evidence: `runs\example\run\evidence\exp-*\{manifest.json,events.jsonl}`.
 ## Tests and validation
 
 ```powershell
-.\.venv\Scripts\python -m pytest -q                              # 163 unit tests (fake sockets / process / process table; NOT MAME evidence), incl. session lifecycle and ownership
+.\.venv\Scripts\python -m pytest -q                              # 168 unit tests (fake sockets / process / process table; NOT MAME evidence), incl. session lifecycle and ownership
 .\.venv\Scripts\python -I scripts\validate.py                    # 51 regression checks vs real MAME (Shinobi)
 .\.venv\Scripts\python -I scripts\validate_hardening.py          # 100 checks: temp ownership, execution-state matrix, Z80 (incl. hit-time register observation), read semantics
 .\.venv\Scripts\python -I scripts\validate_latency.py --gaps 1,6,12 --reps 2   # debugger-stopped latency (measured), stale replies, retries
@@ -153,8 +153,8 @@ Evidence: `runs\example\run\evidence\exp-*\{manifest.json,events.jsonl}`.
 .\.venv\Scripts\python -I scripts\mcp_bank_e2e.py                # 8 checks: bank-switch example through the MCP client
 .\.venv\Scripts\python -I scripts\validate_multi.py             # 67 checks: multi-address capture (1942 Z80 + Shinobi 68000), unequal rates, cleanup-failure/recovery (test-only hooks)
 .\.venv\Scripts\python -I scripts\mcp_multi_e2e.py              # 11 checks: multi-address capture through the MCP client (manifest structure asserted)
-.\.venv\Scripts\python -I scripts\validate_checkpoint_input.py   # 48 checks: inputs / RAM writes / checkpoints / guards / scheduled path / unresolved instrumentation / unsupported machine (real MAME + test-only observer)
-.\.venv\Scripts\python -I scripts\mcp_checkpoint_e2e.py         # 38 checks: start -> input -> save -> change -> load -> verify -> capture -> stop, through the official MCP SDK client
+.\.venv\Scripts\python -I scripts\validate_checkpoint_input.py   # 62 checks: inputs / RAM writes / checkpoints / guards / scheduled path / unresolved instrumentation / unsupported machine / 1944 device without a state interface (real MAME + test-only observer)
+.\.venv\Scripts\python -I scripts\mcp_checkpoint_e2e.py         # 46 checks: start -> input -> save -> change -> load -> verify -> capture -> stop (Shinobi) and a 1944 part, through the official MCP SDK client
 ```
 Results: `runs\<suite>\results.json` (banked runs: `runs\banked`, `runs\mcp_bank_e2e`). Each script launches and kills only its own isolated MAME
 (distinct ports 9433/9441/9451/9452/9453/9455/9457/9459/9461/9463-9465/9475).
@@ -183,6 +183,8 @@ See [docs/VALIDATION.md](docs/VALIDATION.md) for what passed, what is a limitati
 * **Checkpoints, writes and inputs (managed sessions only):** MAME starts stopped in the debugger, so a checkpoint, a RAM write or an armed press can be made straight after `start_session`; while emulation *runs* save, load and write are refused (`execution_running`) - pause first (`execution_control pause`).
   Save/load use MAME's synchronous debugger state commands and then verify independently (state-file header; frame counter, CPU registers and a digest of MAME's memory shares after a load). If MAME cannot save at that instant the plugin falls back to MAME's scheduled save/load, which runs emulation briefly: the result says `mode: "scheduled"` and `fingerprint_exact: false` (frame window).
   State files and metadata live in the session's run directory (`home\sta\<system>\<id>.sta`, `checkpoints\<id>.json`); a checkpoint id is `<run_id>-cpNNN` and loads in a later session of the same machine and MAME version (the earlier run directory must still exist). A load changes the machine under any recorded experiment, so older experiment ids are refused as stale.
+  **What a load verifies, and what it does not:** `save_checkpoint` returns `fingerprint_coverage` and `load_checkpoint` returns `verification.coverage`: which devices' registers were compared (with counts), which devices have address spaces but **no state interface** (e.g. 1944's `:qsound`; nothing to compare, reported rather than assumed), register read errors or exclusions, the RAM-share digest (bytes hashed vs total, `partial`) and the statement that this is not whole-machine equality. Save and load build the fingerprint the same way and a coverage change counts as a verification difference. `session_info` reports `state_interface` per device; `read_registers` / `capture_breakpoint` on a device without the needed interface return `no_state_interface` / `no_debug_interface`.
+  `start_session` waits (inside its `ready_timeout_s`) while MAME has answered but not yet finished loading its ROMs; a slow cold start of a large set can take about a minute or more.
   A checkpoint, write or press is refused while a capture is active or instrumentation is unresolved. `write_memory` classifies the target from the CPU's declared address map and refuses anything that is not plain RAM; the read-back is the final check. Inputs are counted in emulated frames from the emulator's own frame notifier; the machine sees the press for exactly the requested frames (validated against an independent per-frame port watcher). Machine-specific addresses and input names are never in the server; they live in `tests/fixtures/profiles/`.
 * **Timestamps:** event time fields are harvest-time observations (not hit-time); hit order comes from exact sequence numbers; nothing is instruction-accurate.
 * **Multi-address capture:** one experiment can watch up to 8 breakpoint locations on **one explicitly named CPU** (still one active experiment; no multi-CPU experiments).

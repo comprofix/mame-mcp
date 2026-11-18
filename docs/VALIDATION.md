@@ -21,9 +21,9 @@ Shinobi were out of scope for the hardening milestone; the banked-memory milesto
 | `-I scripts\mcp_restart_e2e.py` | 22 passed, 0 failed (one MCP server process across MAME restarts) | `runs\mcp_restart_e2e\results.json` |
 | `-I scripts\validate_banked.py` | 42 passed, 0 failed (sections BOOT, B, F, H, C, W, S, N on 1942) | `runs\banked\results.json` |
 | `-I scripts\mcp_bank_e2e.py` | 8 passed, 0 failed (bank-switch example through the MCP client) | `runs\mcp_bank_e2e\results.json` |
-| `-m pytest -q` (after the checkpoint/input/write milestone) | 163 passed (fakes only; **not** MAME evidence) | - |
-| `-I scripts\validate_checkpoint_input.py` | 48 passed, 0 failed (sections I, W, C, G, D, U, M; direct bridge + test-only fixture observer, section 10) | `runs\checkpoint_input\results.json` |
-| `-I scripts\mcp_checkpoint_e2e.py` | 38 passed, 0 failed (official MCP SDK client against the production server, section 10) | `runs\mcp_checkpoint_e2e\results.json` |
+| `-m pytest -q` (after the checkpoint/input/write milestone) | 168 passed (fakes only; **not** MAME evidence; 163 before the device-state correction, section 10c) | - |
+| `-I scripts\validate_checkpoint_input.py` | 62 passed, 0 failed (sections I, W, C, G, D, U, M, S; direct bridge + test-only fixture observer, sections 10 and 10c; was 48 before section S) | `runs\checkpoint_input\results.json` |
+| `-I scripts\mcp_checkpoint_e2e.py` | 46 passed, 0 failed (official MCP SDK client against the production server, sections 10 and 10c; was 38 before the 1944 part) | `runs\mcp_checkpoint_e2e\results.json` |
 | `-I scripts\example_experiment.py` / `bridge_smoke.py` | ran; `RESULT: as expected` | `runs\example\...` |
 
 Hardening/fixture design: `tests\fixtures\plugins\mamemcp_fixture` is a **test-only** plugin (file mailbox) that
@@ -370,6 +370,79 @@ Evidence class: Claude Code (Sonnet 5.5) called the registered `mame` MCP tools 
 * **Stop:** `stop_session` reported `input_cleanup` released (`was_holding: false`, no release errors), capture cleanup verified with no unresolved instrumentation, process identity verified (image, creation time, bridge port) and terminated, `cleanup_failures == []`; `session_info` afterwards `no_session` with `last_session.exit_reason == stopped_by_stop_session`. `exit_code` 1 is the Windows termination code (see 9a), not an emulator status.
 
 **Limitations of the live run:** one Shinobi run and one save/write/load cycle; anonymous RAM is outside the verification digest; inputs armed while stopped or paused (the held-until-resume case) were **not** exercised live (harness only, above); no error path, cross-session load, scheduled-save path or machine other than Shinobi was run live.
+
+### 10b. Live Claude Code compatibility smoke test on 1944 (2026-11-18): save FAILED, defect found (live-client evidence; separate from the harness results)
+Target selected by the user for this test: MAME 0.289 (`D:\arcade\mame\mame.exe`), ROM directory `D:\arcade\mame\roms`, system `1944` (parent set, "1944: The Loop Master (Europe 000620)", `capcom/cps2.cpp`, MC68000 `:maincpu` + Z80 `:audiocpu`; `-verifyroms 1944` good; `1944.zip` SHA-256 `9186f400aa9cfcdf2720c16bf9801da0e782c5ca6e4bfcdac70c3dc30bbe508d`, SHA-1 `bcb9f0846ce8acd97e697e4596b8403c136d65ba`; the archive hash identifies the local package, the individual ROM CRC/SHA-1 definitions from `-listxml` identify the contents). One run through the registered `mame` MCP tools:
+* **Startup PASS**, **inputs PASS as tool mechanics** (Coin 1 and 1 Player Start on `:IN2`, P1 Button 1 on `:IN0`, each 10 requested / 10 elapsed / 10 observed, release verified), **cleanup PASS** (held-input cleanup, no unresolved instrumentation, process terminated, `no_session`).
+* **Gameplay was not established.** No screen and no known game-state variable were available; input presses and release do not show that the game accepted a coin or started.
+* **Save FAILED:** `save_checkpoint` while paused returned `internal_error: ...init.lua:1662: bad argument #1 to 'for iterator' (table expected, got nil)`. No file was created; `list_checkpoints` was empty. Load was therefore BLOCKED.
+* `session_info` had already shown the same defect in its device list: `:qsound` (QSound HLE) reported `breakpoints` and `register_count` as unavailable with the Lua errors `init.lua:249: attempt to index a nil value (field 'debug')` and `init.lua:285: bad argument #1 to 'for iterator' (table expected, got nil)`.
+* A `write_memory` to `0xFF0000` (width 1, `0x00` -> `0x01` -> `0x00`) was accepted as plain RAM and read back, with a manual revert; `0x900012` was refused as `unsupported_target` (read handler `ram`, write handler `delegate`). That address was a guess and is not a justified mutation target.
+* The PC was observed around `0x7F4`/`0x7F6` after the coin/start presses; its meaning was not established in that run (see 10c).
+
+### 10c. Correction: devices without a state interface (harness evidence; live retests are in 10d and 10e)
+**Cause (confirmed from the plugin source and the retained error text):** the plugin treated "has an address space" as "has registers". `:qsound` (`qsound_hle`) exposes a ROM address space but no `state` interface (and no `debug` interface), so `dev.state` / `dev.debug` is nil. `fingerprint()` (checkpoints), `session_info` (`register_count`, `breakpoints`), `read_registers`, and the capture register/breakpoint path all dereferenced it. Other consequences found while inspecting these paths: `fingerprint()` silently skipped registers that failed to read (and a failed RAM digest), which would have weakened verification without saying so.
+
+**Correction (`plugin/mamemcp/init.lua`):**
+* An interface probe separates **absent** (nil, no error) from a **real read error** (an error string); the two are reported differently everywhere.
+* The fingerprint records coverage per device: `covered` with its register count; `no_state_interface`; or `state_read_error` with the error. Registers that cannot be read or are not integers are listed as excluded (count and examples) instead of being dropped. A failed RAM digest is recorded (`ram_error`), not omitted. Save and load both build the fingerprint with the same function, and the load compares coverage (device set, covered flag, register counts) as well as values, so a coverage change is a verification difference. Fingerprints stored before this field existed carry no `devices` and are compared on values only.
+* `save_checkpoint` returns `fingerprint_coverage` and `load_checkpoint` returns `verification.coverage`: registers compared per device, devices without a state interface, read errors, excluded registers, the RAM-share digest (shares, bytes hashed vs total, `partial`) and the statement that this is **not** whole-machine equality. The coverage is also stored in the checkpoint's metadata file and returned by `list_checkpoints`.
+* `session_info` reports `state_interface` (`present` / `absent` / `read_error`) per device; an absent interface gives `register_count: 0` with a note, and breakpoints on a device without a debug interface are `{unavailable, interface: "absent"}`.
+* `read_registers` on such a device returns `no_state_interface` (or `state_read_error`); `capture_breakpoint` returns `no_debug_interface` / `no_state_interface` / `debug_interface_error` / `state_read_error`, not `internal_error`.
+* **Startup readiness (adjacent defect, found while validating this):** the bridge can answer while MAME is still loading ROMs; that `session_info` lists no devices and the debugger is not initialised yet. `start_session` judged it immediately (`debugger_unavailable` after 91.6 s in the SDK harness on 1944), and a `resume` sent in that window crashed MAME 0.289 in `running_machine::resume()` (access violation, seen once in a scratch probe). `SessionManager.start` now waits, inside the same wall-clock deadline, while the reply explicitly lists an empty device set (a MAME that exits meanwhile or never finishes is reported as before). The harness `Inst` helper does the same. This was not part of the requested change; it is recorded here so it can be reviewed separately.
+
+**Harness results (real MAME 0.289, all 0 failed):**
+* `pytest` 168 passed (+5: the readiness wait x4, coverage persisted/returned for a machine with a device lacking a state interface). Fakes only; not MAME evidence.
+* `validate_checkpoint_input.py` 62 passed (48 + section **S** on 1944, 13 checks, + a Shinobi coverage check). Section S: `session_info` reports `:qsound` as `state_interface: absent`, `register_count: 0`, breakpoints interface absent (no raw Lua text); `read_registers` / capture on it return `no_state_interface` / `no_debug_interface` while an unknown register is still `unknown_register`; **save while paused completes** (immediate, exact) with `:qsound` recorded as not covered and registers compared on `:maincpu` (20) and `:audiocpu` (27); after ~2 s of emulation the **load verifies exactly** (frame 566 -> 439, 47 registers compared, effect observed) and its coverage equals the save's; a byte written to RAM (`0xFF0000`, accepted by `write_memory` as plain RAM, independent read agrees, emulation **not** resumed) is restored by the load (independent read). Shinobi: coverage reported for `:maincpu`, `:soundcpu`, `:upd7751`, none lacking a state interface.
+* `mcp_checkpoint_e2e.py` 46 passed (38 + coverage checks in the Shinobi flow + a 1944 part through the production server and the official SDK client: `start_session(1944)`, device reporting, save, advance, exact load, RAM mutation restored, input discovery on 1944's own fields, server shutdown with a held input on the 1944 session).
+* Regression, same run: `validate.py` 51, `validate_hardening.py` 100, `validate_banked.py` 46, `validate_multi.py` 95, `mcp_e2e.py` 13, `mcp_session_e2e.py` 40, `mcp_restart_e2e.py` 22, `mcp_bank_e2e.py` 8, `mcp_multi_e2e.py` 11. `validate_latency.py` was not rerun. Four of those scripts (`validate_banked`, `validate_multi`, `mcp_multi_e2e`, `mcp_session_e2e`) pointed at `D:\arcade\ROMs\MAME 0.289 ROMs (merged)`, which now holds no sets; their ROM-directory constant was changed to `D:\arcade\mame\roms` so they could run. A harness flake was also fixed: `press_inputs` can return before the machine's next frame sets `release_verified`, so the harness polls for it (wall clock).
+* A harness check that wanted `input_status == "none"` after a completed press was wrong (`released` is correct) and was fixed.
+
+**The PC loop around `0x7F4`/`0x7F6` (investigated; harness evidence):** after the same coin/start sequence and running to frame ~1500, 40 of 40 `CURPC` samples were at `0x7EE` or `0x7F4`. The bytes at `0x7EE` in the `opcodes` space are `4a79 00921cc4 6700 fff8`, which I decoded by hand as `TST.W $00921CC4 ; BEQ` back to the test - a poll of a flag at `0x921CC4`. The instructions after it include `ADDQ.W #1,$00921CD0`; that word advanced by exactly one per frame (967 -> 1049 over frames 1513 -> 1595), so the loop is left once per frame: a frame-synchronisation wait, not a hang. The flag itself read 0 at every sample. **Not established:** what sets the flag (presumably an interrupt handler; not checked), whether the game is in attract mode or gameplay, and whether the coin or start was accepted. Earlier in the boot (before the presses, ~6 s) the PC was in a different loop (`0x6A8`/`0x6AE`).
+
+**Remaining limits and what is not claimed:**
+* **Live validation:** this section is harness evidence only. The live retests that followed are recorded in 10d (intermediate, with a stale server and a disregarded checkpoint) and 10e (completed). 10b remains the original live failure.
+* **RAM-mutation target.** `0xFF0000` is accepted by `write_memory` as plain RAM, but mapped RAM and zero bytes do not show a location is unused. The test is valid because no emulation runs between the write and the load, so the machine cannot observe the value; restoration is verified by an independent read of that byte. It does not show the location is unused, and it says nothing about Side Fighter or any game field.
+* **The RAM-share digest is partial on 1944** (9 shares, 262,144 of 4,415,628 bytes hashed), so on this machine the digest is weak evidence and the independent read of the mutated byte is the restoration evidence. Load verification here means: frame counter, registers of the CPUs, and the digest above - not whole-machine equality. Device-internal state of devices without a register interface (QSound), anonymous RAM and the rest of the state file are not compared.
+* Gameplay establishment and checkpoint compatibility are separate questions; input presses and release do not prove the game accepted a coin or started. No observable game-state variable has been established for 1944.
+* Wall-clock limits are enforced in the new harness (monotonic deadlines for startup, frame waits and sampling); emulated time is only reported.
+* Startup of 1944 is slow when MAME loads the ROMs cold (up to ~90 s observed); `start_session` accepts `ready_timeout_s` up to 120.
+* Validated on Shinobi, 1944 and one machine without save-state support (`005`) only, on Windows.
+
+### 10d. Live 1944 retest, first attempt (2026-11-18): save and load worked, save-side coverage NOT shown (live-client evidence; historical)
+Same target as 10e, through the registered `mame` tools after the plugin fix. Recorded as it happened, including two problems:
+* **Stale Python server.** The MCP server process had not been restarted, so it still ran the old `operations.py`. The plugin is loaded afresh with every MAME start, so `session_info` already showed the new fields (`state_interface: absent` for `:qsound`, no Lua error text) and the load reply carried `verification.coverage`; but the **save reply carried no `fingerprint_coverage`**, because the old server dropped the field. The save-side coverage was therefore not observed in this run.
+* **Disregarded frame-zero checkpoint.** The first "run for about 3 s" did not run: resume, a sleep and pause were issued in one parallel batch (an operator sequencing error, not a product defect), so they executed back-to-back and `…-a15969-cp001` was saved at **frame 0** (emulated 0.017 s). It is disregarded as evidence. The run was redone sequentially and `…-a15969-cp002` was saved at frame 383.
+* Results otherwise: start ready (about 43 s cold), `:qsound` reported absent, save `completed` / `immediate` / `fingerprint_exact` true, advance to frame 713, **load restored frame 383**, `exact` true, 47 registers compared, load coverage reported (`:qsound` without a state interface, no read errors, partial RAM digest), cleanup verified, `no_session`.
+* Conclusion at the time: the original `save_checkpoint` failure was fixed, but save-side coverage and save/load coverage agreement were still unshown live. The MCP server was then reconnected (`/mcp`) to load the updated Python.
+
+### 10e. Live 1944 retest, completed (2026-11-18): CLOSES the save-side coverage gap (live-client evidence)
+Run through the registered `mame` tools only, each dependent step sequential, with the updated server loaded (checked by requiring `fingerprint_coverage` in the save reply). Run `1944-20261118-233210-e6431c`.
+
+**Target:** system `1944` (parent set, `parent: "0"`), "1944: The Loop Master (Europe 000620)", MAME 0.289 (`D:\arcade\mame\mame.exe`), ROM directory `D:\arcade\mame\roms`, `1944.zip` SHA-1 `bcb9f0846ce8acd97e697e4596b8403c136d65ba`, `-verifyroms` good. No test hooks, no unresolved instrumentation, debugger available, CPUs populated on the first `session_info` (`:maincpu` 22 registers, `:audiocpu` 29, `:qsound` absent state interface with no Lua error text). No session was active beforehand.
+
+**Sequence and results:**
+| Step | Result |
+|---|---|
+| Resume ~4 s wall, pause | running, then paused |
+| `save_checkpoint` | `…-e6431c-cp001`: `completed`, mode `immediate`, `fingerprint_exact` true, **frame 464** (emulated 7.80 s), 0 frames run during the operation; **`fingerprint_coverage` present in the reply** |
+| Resume ~3 s wall, pause | frame advanced **464 -> 864** |
+| `load_checkpoint` | `completed`, mode `immediate`, no error; **frame 864 -> 464** (`expected_frame` 464, `frame_after_load` 464), `load_effect_observed` true, method `frame_and_cpu_registers_exact`, `exact` true, **47 registers compared** |
+| `stop_session` | input cleanup released, no active experiment, unresolved instrumentation `[]`, process identity verified and terminated, no cleanup failures; `session_info` then `no_session` |
+
+**Save-side `fingerprint_coverage` and load-side `verification.coverage` were identical (no differences):**
+* registers compared: `:maincpu` 20, `:audiocpu` 27 (47 in total);
+* no state interface: `:qsound` (QSound HLE; nothing to compare or verify);
+* read errors: none (`state_read_error: []`); excluded registers: none;
+* RAM digest: **partial**, 262,144 of 4,415,628 bytes hashed over 9 memory shares (digest `69b1fa47`); anonymous RAM is not covered;
+* the reply's own caveat: device-internal state of devices without a register interface, anonymous RAM and any other state in the file are not compared; this is not a whole-machine equality check.
+
+**What this establishes:** on real MAME 0.289 through the production server and a live Claude Code client, `save_checkpoint` on 1944 now completes (10b's failure is not reproduced), and the checkpoint restores the saved frame with the saved CPU registers. **Exactness applies only to the reported coverage** (the 47 registers, the frame counter and the partial RAM digest). It is not whole-machine equality; QSound internal state is not checked.
+
+**What it does not establish (unresolved):**
+* **Gameplay.** No coin, start or input was sent in this run, and a responsive frame loop plus a successful restore do not show attract mode or gameplay. Gameplay on 1944 remains unestablished (10b's coin/start presses proved only the tool mechanics; the `0x7EE`-area PC loop in 10c is a frame-synchronisation poll and says nothing about the game state).
+* **Side Fighter / game-specific research.** Not done and not part of this validation; no game-state addresses are known.
+* RAM mutation was not repeated live (it is covered by the harness, 10c). The RAM digest is partial on this machine.
 
 ## Failed during development (found by validation, fixed)
 Original POC: `bpset(addr)` without condition/action crashes MAME 0.289; expressions are hex by default (`#` for decimal);
