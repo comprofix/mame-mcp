@@ -36,6 +36,7 @@ from .protocol import BridgeError
 NO_SESSION, STARTING, READY, STOPPING, EXITED, FAILED = "no_session", "starting", "ready", "stopping", "exited", "failed"
 SYSTEM_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,31}$")  # MAME short names; no path or option syntax can pass
 DEFAULT_READY_TIMEOUT = 60.0
+STARTUP_POLL_S = 0.5  # while MAME answers but has not finished loading (no devices listed yet)
 MIN_READY_TIMEOUT, MAX_READY_TIMEOUT = 5.0, 120.0
 TERMINATE_WAIT, KILL_WAIT = 5.0, 3.0
 DRAIN_WAIT = 20.0
@@ -271,6 +272,12 @@ class SessionManager(StateOperations):
         raise BridgeError("rom_not_found", f"no ROM set named '{system}' (.zip/.7z/folder) in the configured ROM paths",
                           detail={"searched": [str(p) for p in self.cfg.rompaths]})
 
+    @staticmethod
+    def _still_loading(info: dict[str, Any]) -> bool:
+        """True when the reply explicitly lists an empty device set (MAME is up but has not finished starting)."""
+        cpus = info.get("cpus")
+        return isinstance(cpus, (list, dict)) and len(cpus) == 0
+
     def start(self, system: str, ready_timeout: float | None = None) -> dict[str, Any]:
         if not isinstance(system, str) or not SYSTEM_RE.match(system):
             raise BridgeError("bad_argument", "system must be a MAME short name: lowercase letters, digits, underscore (e.g. 'shinobi')")
@@ -330,6 +337,20 @@ class SessionManager(StateOperations):
             except BridgeError as e:
                 if e.code != "connect_failed":
                     raise
+        # The bridge can answer while MAME is still loading ROMs: that session_info lists no devices and the debugger is not
+        # initialised yet, so judging it (debugger_unavailable) or sending requests then is wrong (a resume sent in that window
+        # crashed MAME 0.289 in running_machine::resume). Wait, inside the same deadline, until devices are listed.
+        while self._still_loading(bridge_info):
+            if self._shutting_down:
+                raise BridgeError("shutting_down", "the MCP server is shutting down")
+            rc = proc.poll()
+            if rc is not None:
+                s.exit_code = rc
+                raise BridgeError("mame_exited_during_startup", f"MAME exited with code {rc} before it finished starting")
+            if time.monotonic() >= deadline:
+                raise BridgeError("startup_timeout", f"MAME answered but had not finished starting (no devices listed) within {timeout:g} s")
+            time.sleep(STARTUP_POLL_S)
+            bridge_info = s.client.request("session_info", {}, retry_safe=True)
         machine = (bridge_info.get("machine") or {}).get("name")
         if machine != s.system:
             raise BridgeError("machine_mismatch", f"MAME reports machine '{machine}', expected '{s.system}'")

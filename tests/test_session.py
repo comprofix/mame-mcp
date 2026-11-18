@@ -42,7 +42,8 @@ class FakeProc:
 
 class FakeClient:
     def __init__(self, machine="shinobi", test_hooks=None, debugger=True, connect_errors=0, active="exp-s1-001",
-                 cancel_verified=True, cancel_error=None):
+                 cancel_verified=True, cancel_error=None, loading_polls=None):
+        self.loading_polls = loading_polls  # None: ready at once; N: the first connect + N-1 session_info replies list no devices / no debugger yet
         self.machine, self.test_hooks, self.debugger = machine, test_hooks or [], debugger
         self.connect_errors, self.active = connect_errors, active
         self.cancel_verified, self.cancel_error = cancel_verified, cancel_error
@@ -56,12 +57,23 @@ class FakeClient:
             time.sleep(0.01)
             raise BridgeError("connect_failed", "nobody listening")
         self.session_id, self.connected = "s1-aaaaaa", True
+        return self._info()
+
+    def _info(self):
+        loading = self.loading_polls is not None and self.loading_polls > 0
+        if loading:
+            self.loading_polls -= 1
+        return {"cpus": [] if loading else [{"tag": ":maincpu"}], **self._base_info(loading)}
+
+    def _base_info(self, loading):
         return {"machine": {"name": self.machine, "description": "d", "year": "1987", "manufacturer": "Sega"},
                 "execution": {"state": "debugger_stopped"}, "mame_version": "0.289", "test_hooks": self.test_hooks,
-                "bridge": {"session_id": self.session_id, "debugger_available": self.debugger}}
+                "bridge": {"session_id": self.session_id, "debugger_available": False if loading else self.debugger}}
 
     def request(self, op, args=None, *, timeout=None, mutating=False, retry_safe=False):
         self.log.append(op)
+        if op == "session_info" and self.loading_polls is not None:
+            return {**self._info(), "active_experiment": None, "unresolved_instrumentation": []}
         if op == "session_info":
             return {"active_experiment": self.active if "cancel_experiment" not in self.log else None,
                     "unresolved_instrumentation": []}
@@ -469,3 +481,50 @@ def test_launcher_never_passes_test_hooks_or_fixture_into_production(monkeypatch
     assert "mamemcp_fixture" not in " ".join(seen["cmd"]) and "-debug" in seen["cmd"]
     assert seen["env"]["MAMEMCP_PORT"] == "5555" and seen["stdin"] == subprocess.DEVNULL
     assert info["test_env"] == {}
+
+
+# ------------------------------------------------------------------------------------------------ startup readiness
+def test_start_waits_while_mame_answers_but_has_not_finished_loading(tmp_path, monkeypatch):
+    """The bridge can answer during ROM loading with no devices and no debugger yet; that must not be judged (debugger_unavailable)
+    and no request other than session_info may be sent before the machine has finished starting."""
+    monkeypatch.setattr(session, "STARTUP_POLL_S", 0.01)
+    r = Rig(tmp_path, loading_polls=4)
+    info = r.mgr.start("shinobi", ready_timeout=5)
+    assert info["state"] == "ready"
+    log = r.clients[0].log
+    assert log.count("session_info") >= 3 and set(log) == {"session_info"}
+    assert r.procs[0].rc is None  # the process was never touched
+
+
+def test_start_times_out_if_mame_never_finishes_loading_and_stops_only_its_process(tmp_path, monkeypatch):
+    monkeypatch.setattr(session, "STARTUP_POLL_S", 0.01)
+    r = Rig(tmp_path, loading_polls=10_000)
+    with pytest.raises(BridgeError) as e:
+        r.mgr.start("shinobi", ready_timeout=0.3)
+    assert e.value.code == "startup_timeout" and "no devices" in e.value.message
+    assert r.procs[0].rc is not None and r.mgr.snapshot()["state"] in ("failed", "no_session")
+
+
+def test_start_reports_a_real_missing_debugger_only_once_devices_are_listed(tmp_path, monkeypatch):
+    monkeypatch.setattr(session, "STARTUP_POLL_S", 0.01)
+    r = Rig(tmp_path, loading_polls=2, debugger=False)
+    with pytest.raises(BridgeError) as e:
+        r.mgr.start("shinobi", ready_timeout=5)
+    assert e.value.code == "debugger_unavailable" and r.clients[0].log.count("session_info") >= 2
+
+
+def test_start_exits_the_wait_if_mame_dies_while_loading(tmp_path, monkeypatch):
+    monkeypatch.setattr(session, "STARTUP_POLL_S", 0.01)
+    r = Rig(tmp_path, loading_polls=10_000)
+    r.proc_kw = {}
+    orig = r._launch
+
+    def launch(**kw):
+        p, info = orig(**kw)
+        threading.Timer(0.1, lambda: setattr(p, "rc", 3)).start()
+        return p, info
+
+    r.mgr._launch = launch
+    with pytest.raises(BridgeError) as e:
+        r.mgr.start("shinobi", ready_timeout=5)
+    assert e.value.code == "mame_exited_during_startup"
