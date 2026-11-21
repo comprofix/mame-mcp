@@ -159,7 +159,10 @@ function exports.startplugin()
 		local dbg = m.debugger
 		local dstate = dbg and dbg.execution_state or nil
 		local state
-		-- precedence: a debugger stop also sets machine.paused on this build, so check it first
+		-- `paused` is MAME's raw pause flag (machine.paused), reported exactly as read. It does not track the debugger stop: on
+		-- MAME 0.289 it was seen true in the startup snapshot and false in later reads while debugger_state stayed "stop". So
+		-- `state` is the authoritative classification: a debugger stop takes precedence over the raw flag, and only without a
+		-- stop does the flag decide paused or running. `state` == "running" does not prove frames are advancing.
 		if dstate == "stop" then state = "debugger_stopped"
 		elseif m.paused then state = "paused"
 		else state = "running" end

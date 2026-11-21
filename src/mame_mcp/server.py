@@ -72,7 +72,10 @@ mcp = MCPServer(
         "(e.g. system='shinobi') to launch an isolated MAME with the debugger, inspect/capture with the other tools, and "
         "call stop_session when done (it finalises an active capture and stops only the MAME this server started). "
         "MAME starts stopped in the debugger: resume it with execution_control. session_info works at any time and "
-        "reports no_session/starting/ready/stopping/exited/failed. Reads are inspection-only. "
+        "reports no_session/starting/ready/stopping/exited/failed. Execution: `state` is the authoritative running/paused/"
+        "debugger_stopped classification (`paused` is MAME's raw pause flag and can vary while the debugger is stopped); "
+        "start_session returns a startup snapshot; execution_control only acknowledges a request, so confirm with a fresh "
+        "session_info; a running state does not prove frames are advancing. Reads are inspection-only. "
         "capture_breakpoint starts an asynchronous, limit-bounded experiment inside MAME: poll "
         "experiment_status. Detailed events are written to JSONL evidence files, not returned here. "
         "Experiment ids belong to one session; ids from an earlier session are refused. "
@@ -215,7 +218,9 @@ def _session_info_blocking() -> dict[str, Any]:
 async def start_session(system: str, ready_timeout_s: float = 60.0) -> dict[str, Any]:
     """Launch an isolated MAME for `system` (a MAME short name such as 'shinobi') with the mamemcp plugin and the
     debugger enabled, wait (bounded by `ready_timeout_s`, 5..120) until the bridge answers, and return the session id,
-    machine identity, execution state and the run/evidence directories. MAME starts stopped in the debugger; use
+    machine identity, an `execution` snapshot and the run/evidence directories. That snapshot was observed while the
+    bridge was starting up and is not re-read when the reply is returned: call session_info for the current execution
+    state. MAME starts stopped in the debugger; use
     execution_control(action='resume') to run it. Refused while a managed session is active. The executable, ROM
     paths and MAME arguments are fixed by server configuration and cannot be set here. On failure the diagnostics
     are in the error and only the process this attempt launched is stopped."""
@@ -241,8 +246,12 @@ async def stop_session() -> dict[str, Any]:
 async def session_info() -> dict[str, Any]:
     """Session state (`session.state`: no_session | starting | ready | stopping | exited | failed, with ownership
     managed/external, ids, run and evidence directories, exit code and failure diagnostics) and, when connected,
-    the MAME version, machine, CPU tags with address spaces and installed breakpoints, execution state
-    (running | paused | debugger_stopped), ROM identity and bridge capabilities/limits. Works with no MAME running."""
+    the MAME version, machine, CPU tags with address spaces and installed breakpoints, an `execution` block read fresh
+    at call time, ROM identity and bridge capabilities/limits. In `execution`, `state` (running | paused |
+    debugger_stopped) is the authoritative combined classification: a debugger stop takes precedence over a pause.
+    `debugger_state` is the debugger's run/stop state and `paused` is MAME's raw pause flag, which can vary while
+    `debugger_state` is `stop`, so do not rely on it alone. A `running` state does not by itself prove frames or gameplay
+    are advancing: `clock` (emulated time and frame) read across calls shows that. Works with no MAME running."""
     return await anyio.to_thread.run_sync(_session_info_blocking)
 
 
@@ -369,8 +378,10 @@ async def cancel_experiment(experiment_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def execution_control(action: Literal["pause", "resume"]) -> dict[str, Any]:
-    """Pause the emulation, or resume it (also leaves a debugger stop). The effect is requested, not
-    confirmed: re-check with session_info. Included only because experiments need a way to get MAME
+    """Pause the emulation, or resume it (also leaves a debugger stop). The reply only acknowledges the request: its
+    `before` and `after_request` are read inside the request and are not a confirmed result. Confirm the resulting
+    `execution.state` with a fresh session_info; a `running` state does not by itself prove frames or gameplay are
+    advancing. Included only because experiments need a way to get MAME
     running; it does not single-step or run debugger commands."""
     return await anyio.to_thread.run_sync(lambda: _call("execution_control", action))
 
