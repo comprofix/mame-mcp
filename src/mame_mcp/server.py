@@ -4,9 +4,14 @@ Protocol output stays on stdout (owned by the MCP SDK); diagnostics go to stderr
 
 Startup never needs MAME: the server initialises with no emulator running. `start_session` launches an isolated,
 server-owned MAME on demand and `stop_session` stops it (see session.py). Configuration (environment, all optional):
-  MAMEMCP_MAME_DIR     folder containing mame.exe (default D:\\arcade\\mame, or MAME_DIR)
-  MAMEMCP_ROMPATH      ROM search directories, ';'-separated; the first holding <system>.zip/.7z/folder is used
-  MAMEMCP_RUNS_DIR     parent of the per-session run directories (default <repo>\\runs\\sessions)
+  MAMEMCP_MAME_EXE     MAME executable: a path, or a command name looked up on PATH (takes precedence over MAMEMCP_MAME_DIR)
+  MAMEMCP_MAME_DIR     folder containing the executable (mame.exe on Windows, mame elsewhere). Without either variable:
+                       Windows uses D:\\arcade\\mame (or MAME_DIR), other platforms use `mame` found on PATH
+  MAMEMCP_MAME_PLUGINS MAME's own plugin folder (boot.lua, json). Default: `plugins` next to the executable if it is there,
+                       otherwise the pluginspath of MAME's own configuration (-showconfig)
+  MAMEMCP_ROMPATH      ROM search directories, ';'-separated; the first holding <system>.zip/.7z/folder is used.
+                       Default: `roms` next to the executable if it exists, otherwise MAME's configured rompath
+  MAMEMCP_RUNS_DIR     parent of the per-session run directories (default <repo>/runs/sessions)
 
 Optional EXTERNAL attachment (compatibility; not owned by this server, never started, stopped or killed by it):
   MAMEMCP_PORT         bridge port of an already-running MAME with the mamemcp plugin. Without it nothing is

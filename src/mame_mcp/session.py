@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import launcher, winwake
+from . import launcher, procinfo, winwake
 from .bridge import BridgeClient
 from .operations import StateOperations
 from .protocol import BridgeError
@@ -50,51 +50,80 @@ def _norm(p: str | Path) -> str:
     return os.path.normcase(os.path.normpath(str(p)))
 
 
+def _same_file(a: str | Path, b: str | Path) -> bool:
+    """Same path, literally or once symlinks are resolved (a Linux /proc image is always the resolved path)."""
+    return _norm(a) == _norm(b) or _norm(os.path.realpath(a)) == _norm(os.path.realpath(b))
+
+
 @dataclass
 class SessionConfig:
-    """Machine-local settings (from the MCP server's environment); never taken from tool arguments."""
-    mame_dir: Path = field(default_factory=lambda: launcher.DEFAULT_MAME_DIR)
+    """Machine-local settings (from the MCP server's environment); never taken from tool arguments.
+
+    The executable is `exe` when given, otherwise `mame_dir` + the platform's executable name when a folder is given,
+    otherwise launcher.default_mame_exe() (Windows: the built-in folder; elsewhere: `mame` on PATH). MAME's own plugin
+    folder (`plugins`) is separate from the executable's folder, because packaged Linux installations keep them apart."""
+    mame_dir: Path | None = None
     rompaths: list[Path] = field(default_factory=list)
     runs_dir: Path = field(default_factory=lambda: launcher.PROJECT_ROOT / "runs" / "sessions")
+    exe: Path | None = None
+    plugins: Path | None = None
+    runtime: Path | None = None  # MAMEMCP_MAME_RUNTIME: the real executable behind a wrapper-script launch command
 
     def __post_init__(self) -> None:
         if not self.rompaths:
-            self.rompaths = [self.mame_dir / "roms"]
+            self.rompaths = launcher.default_rompaths(self.mame_exe)
 
     @property
     def mame_exe(self) -> Path:
-        return self.mame_dir / "mame.exe"
+        if self.exe is not None:
+            return self.exe
+        return self.mame_dir / launcher.MAME_EXE_NAME if self.mame_dir is not None else launcher.default_mame_exe()
+
+    @property
+    def mame_plugins(self) -> Path:
+        return self.plugins or launcher.mame_plugins_dir(self.mame_exe)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "SessionConfig":
         env = os.environ if env is None else env
         kw: dict[str, Any] = {}
+        if env.get("MAMEMCP_MAME_EXE"):
+            kw["exe"] = launcher.resolve_mame_exe(env["MAMEMCP_MAME_EXE"])
+        if env.get("MAMEMCP_MAME_RUNTIME"):
+            kw["runtime"] = Path(env["MAMEMCP_MAME_RUNTIME"])
         if env.get("MAMEMCP_MAME_DIR"):
             kw["mame_dir"] = Path(env["MAMEMCP_MAME_DIR"])
+        if env.get("MAMEMCP_MAME_PLUGINS"):
+            kw["plugins"] = Path(env["MAMEMCP_MAME_PLUGINS"])
         if env.get("MAMEMCP_ROMPATH"):
             kw["rompaths"] = [Path(x) for x in env["MAMEMCP_ROMPATH"].split(";") if x.strip()]
         if env.get("MAMEMCP_RUNS_DIR"):
             kw["runs_dir"] = Path(env["MAMEMCP_RUNS_DIR"])
         return cls(**kw)
 
+    def runtime_exe(self) -> Path:
+        """The image the launched MAME process must have (see launcher.runtime_executable); raises RuntimeIdentityError."""
+        return launcher.runtime_executable(self.mame_exe, self.runtime)
+
     def public(self) -> dict[str, Any]:
-        return {"mame_exe": str(self.mame_exe), "rompaths": [str(p) for p in self.rompaths], "runs_dir": str(self.runs_dir)}
+        return {"mame_exe": str(self.mame_exe), "mame_plugins": str(self.mame_plugins),
+                "rompaths": [str(p) for p in self.rompaths], "runs_dir": str(self.runs_dir)}
 
 
 class ProcessIdentity:
-    """Windows process facts used to prove a pid is the MAME this server launched (replaceable in tests)."""
+    """Process facts (Windows or Linux, see procinfo) used to prove a pid is the MAME this server launched (replaceable in tests)."""
 
     def available(self) -> bool:
-        return winwake.available()
+        return procinfo.available()
 
     def image(self, pid: int) -> str | None:
-        return winwake.process_image(pid)
+        return procinfo.process_image(pid)
 
     def created(self, pid: int) -> int | None:
-        return winwake.creation_time(pid)
+        return procinfo.creation_time(pid)
 
     def port_owners(self, port: int) -> set[int]:
-        return winwake.port_owner_pids(port)
+        return procinfo.port_owner_pids(port)
 
 
 def _free_port() -> int:
@@ -119,6 +148,7 @@ class Session:
     proc: Any = None
     pid: int | None = None
     created: int | None = None
+    runtime: Path | None = None  # the verified runtime image, established before launch
     client: BridgeClient | None = None
     launch_info: dict[str, Any] | None = None
     session_id: str | None = None
@@ -285,7 +315,12 @@ class SessionManager(StateOperations):
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not (MIN_READY_TIMEOUT <= timeout <= MAX_READY_TIMEOUT):
             raise BridgeError("bad_argument", f"ready_timeout_s must be {MIN_READY_TIMEOUT:g}..{MAX_READY_TIMEOUT:g}")
         if not self.cfg.mame_exe.is_file():
-            raise BridgeError("mame_not_found", f"configured MAME executable does not exist: {self.cfg.mame_exe} (set MAMEMCP_MAME_DIR)")
+            raise BridgeError("mame_not_found", f"configured MAME executable does not exist: {self.cfg.mame_exe} "
+                              "(set MAMEMCP_MAME_EXE or MAMEMCP_MAME_DIR, or put mame on PATH)")
+        try:
+            runtime = self.cfg.runtime_exe()  # before anything is launched; refusal leaves no process behind
+        except launcher.RuntimeIdentityError as e:
+            raise BridgeError("runtime_unverified", str(e)) from e
         rompath = self._find_rompath(system)
         with self._cond:
             if self._shutting_down:
@@ -300,6 +335,7 @@ class SessionManager(StateOperations):
             run_id = f"{system}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
             run_dir = (self.cfg.runs_dir / run_id).resolve()
             s = Session(run_id=run_id, system=system, port=self._port_picker(), run_dir=run_dir, evidence_dir=run_dir / "evidence")
+            s.runtime = runtime
             self._current = s
         try:
             return self._start(s, rompath, float(timeout))
@@ -313,8 +349,8 @@ class SessionManager(StateOperations):
 
     def _start(self, s: Session, rompath: Path, timeout: float) -> dict[str, Any]:
         try:  # production launch: debugger on, production plugin only, no fixture, no test_env, no extra arguments
-            proc, info = self._launch(system=s.system, port=s.port, run_dir=s.run_dir, mame_dir=self.cfg.mame_dir,
-                                      rompath=rompath, debug=True)
+            proc, info = self._launch(system=s.system, port=s.port, run_dir=s.run_dir, mame_exe=self.cfg.mame_exe,
+                                      plugins_dir=self.cfg.mame_plugins, rompath=rompath, debug=True)
         except Exception as e:
             raise BridgeError("launch_failed", f"could not launch MAME: {type(e).__name__}: {e}") from e
         s.proc, s.pid, s.launch_info = proc, proc.pid, info
@@ -360,6 +396,10 @@ class SessionManager(StateOperations):
             raise BridgeError("debugger_unavailable", "MAME started without the debugger; captures would be refused")
         if self._ident.available() and s.pid not in self._ident.port_owners(s.port):
             raise BridgeError("bridge_owner_mismatch", f"pid {s.pid} does not own bridge port {s.port}; refusing to use it")
+        if self._ident.available():  # ready only when the process is the pre-established runtime image, same instance, owning the port
+            ok, why = self._verify_owned(s, check_port=True)
+            if not ok:
+                raise BridgeError("process_identity_mismatch", f"the launched process is not the expected MAME runtime: {why}")
         with self._cond:
             if s.state != STARTING or self._shutting_down:
                 raise BridgeError("shutting_down", "start was interrupted")
@@ -490,12 +530,12 @@ class SessionManager(StateOperations):
         if s.proc is None or s.pid is None:
             return False, "no process"
         if not self._ident.available():
-            return True, "ownership by Popen handle only (non-Windows)"
+            return True, "ownership by Popen handle only (no process identity probes on this platform)"
         img = self._ident.image(s.pid)
         if not img:
             return False, "process image unreadable (process gone or access denied)"
-        if _norm(img) != _norm(self.cfg.mame_exe):
-            return False, f"image '{img}' is not the configured MAME executable"
+        if s.runtime is None or not _same_file(img, s.runtime):
+            return False, f"image '{img}' is not the expected MAME runtime executable '{s.runtime}'"
         if s.created is not None and self._ident.created(s.pid) != s.created:
             return False, "creation time differs from the recorded one (recycled pid)"
         if not check_port:

@@ -230,17 +230,28 @@ function exports.startplugin()
 	---------------------------------------------------------------------------
 	local lfs = require("lfs")
 
+	-- BEGIN path_prefixes (pure; tests/test_plugin_paths.py runs this block in MAME's own Lua)
+	-- The directories to create for `path`, outermost first. A leading root is kept: "/a/b" (POSIX, or the current drive's
+	-- root on Windows) -> "/a", "/a/b"; a drive "C:/a" -> "C:/a" and drive-relative "C:a" -> "C:a"; a UNC share
+	-- "//srv/share/a" -> "//srv/share/a" (the share itself is never created); a relative "a/b" -> "a", "a/b". "\" counts as "/".
+	local function path_prefixes(path)
+		local p = path:gsub("\\", "/")
+		local acc = p:match("^//[^/]+/[^/]+") or p:match("^%a:") or ""
+		local rest = p:sub(#acc + 1)
+		if rest:sub(1, 1) == "/" then acc = acc .. "/" end
+		local out = {}
+		for part in rest:gmatch("[^/]+") do
+			local last = acc:sub(-1)
+			acc = (acc == "" or last == "/" or last == ":") and (acc .. part) or (acc .. "/" .. part)
+			out[#out + 1] = acc
+		end
+		return out
+	end
+	-- END path_prefixes
+
 	local function mkdir_p(path)
-		local acc = ""
-		for part in path:gmatch("[^/\\]+") do
-			if acc == "" then
-				acc = part
-				if part:match("^%a:$") then acc = part .. "/" ; goto continue end
-			else
-				acc = (acc:sub(-1) == "/") and (acc .. part) or (acc .. "/" .. part)
-			end
-			lfs.mkdir(acc)
-			::continue::
+		for _, dir in ipairs(path_prefixes(path)) do
+			lfs.mkdir(dir)
 		end
 		return lfs.attributes(path, "mode") == "directory"
 	end

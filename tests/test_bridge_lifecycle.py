@@ -3,6 +3,7 @@
 These cover timeout / stale-response / disconnect / session-mismatch / no-retry behaviour only.
 They do not prove anything about MAME: see scripts/validate.py for that.
 """
+import errno
 import json
 import socket
 import threading
@@ -49,6 +50,16 @@ class FakeBridge:
                     self.received.append(req)
                     for out in self.handler(req) or []:
                         conn.sendall(out.encode() + b"\n")
+
+    def disconnect(self):
+        """Drop the client connection as a departing peer would. shutdown() sends FIN and wakes the server thread blocked in
+        recv() on every platform; close() alone does neither on Linux while that recv() holds the socket."""
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except OSError as e:
+            if e.errno != errno.ENOTCONN:  # only "the client already went away" is an expected race
+                raise
+        self.conn.close()
 
     def close(self):
         self.srv.close()
@@ -216,7 +227,7 @@ def test_retry_not_attempted_if_connection_lost_during_wait():
     fb = FakeBridge(lambda r: [ok(r)] if r["op"] == "session_info" and len(fb.received) == 1 else None)
     c = BridgeClient(port=fb.port)
     c.connect(timeout=3)
-    threading.Timer(0.1, lambda: fb.conn.close()).start()
+    threading.Timer(0.1, fb.disconnect).start()
     with pytest.raises(BridgeError) as e:
         c.request("session_info", timeout=2, retry_safe=True)
     assert e.value.code == "mame_disconnected" and c.read_retries == 0

@@ -1,6 +1,7 @@
 """Unit tests for the managed-session lifecycle and ownership logic (fake process, fake bridge client, fake
 process table). They prove the decision logic only; scripts/mcp_session_e2e.py exercises real MAME."""
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -112,10 +113,11 @@ class Rig:
         (tmp_path / "roms").mkdir(exist_ok=True)
         (tmp_path / "roms" / "shinobi.zip").write_bytes(b"x")
         (tmp_path / "mame").mkdir(exist_ok=True)
-        (tmp_path / "mame" / "mame.exe").write_bytes(b"stub")  # presence check only; nothing is executed
-        self.cfg = SessionConfig(mame_dir=tmp_path / "mame", rompaths=[tmp_path / "roms"], runs_dir=tmp_path / "runs")
+        (tmp_path / "mame" / launcher.MAME_EXE_NAME).write_bytes(b"stub")  # presence check only; nothing is executed
+        self.cfg = SessionConfig(mame_dir=tmp_path / "mame", rompaths=[tmp_path / "roms"], runs_dir=tmp_path / "runs",
+                                 plugins=tmp_path / "mame" / "plugins")
         self.ident, self.launches, self.procs, self.clients = FakeIdent(), [], [], []
-        self.proc_kw, self.client_kw = {}, client_kw
+        self.proc_kw, self.client_kw, self.rt = {}, client_kw, None
         self.mgr = SessionManager(self.cfg, launch_fn=self._launch, client_factory=self._client, identity=self.ident,
                                   port_picker=lambda: 5555)
 
@@ -123,7 +125,7 @@ class Rig:
         self.launches.append(kw)
         p = FakeProc(**self.proc_kw)
         self.procs.append(p)
-        self.ident.images[p.pid] = str(self.cfg.mame_exe)
+        self.ident.images[p.pid] = str(self.rt or self.cfg.mame_exe)  # a wrapper rig reports its runtime, as /proc does after the exec
         self.ident.created_map[p.pid] = 777
         self.ident.owners[kw["port"]] = {p.pid}
         return p, {"pid_created_filetime": 777, "romset_zip": {"sha1": "abc"}, "verifyroms": {"output": "romset shinobi is good"}}
@@ -178,8 +180,9 @@ def test_start_launches_production_session_and_reports_identity(rig, tmp_path):
     assert Path(r["run_dir"]).parent == (tmp_path / "runs").resolve() and r["evidence_dir"].endswith("evidence")
     kw = rig.launches[0]
     # production only: no fixture plugin, no test env, no extra MAME arguments, debugger on, only fixed paths
-    assert set(kw) == {"system", "port", "run_dir", "mame_dir", "rompath", "debug"}
-    assert kw["debug"] is True and kw["system"] == "shinobi" and kw["mame_dir"] == rig.cfg.mame_dir
+    assert set(kw) == {"system", "port", "run_dir", "mame_exe", "plugins_dir", "rompath", "debug"}
+    assert kw["debug"] is True and kw["system"] == "shinobi" and kw["mame_exe"] == rig.cfg.mame_exe
+    assert kw["plugins_dir"] == rig.cfg.mame_plugins
     snap = rig.mgr.snapshot()
     assert snap["state"] == READY and snap["ownership"] == "managed" and snap["session_id"] == "s1-aaaaaa"
 
@@ -312,7 +315,7 @@ def test_capture_cancel_error_is_reported(tmp_path):
 
 
 @pytest.mark.parametrize("mutate,why", [
-    (lambda rig, p: rig.ident.images.__setitem__(p.pid, "C:/Windows/notepad.exe"), "not the configured MAME"),
+    (lambda rig, p: rig.ident.images.__setitem__(p.pid, "C:/Windows/notepad.exe"), "not the expected MAME runtime"),
     (lambda rig, p: rig.ident.created_map.__setitem__(p.pid, 1), "recycled pid"),
     (lambda rig, p: rig.ident.owners.__setitem__(5555, {1}), "bridge port"),
     (lambda rig, p: rig.ident.images.pop(p.pid), "unreadable"),
@@ -452,11 +455,200 @@ def test_shutdown_with_no_session_is_a_noop(rig):
 
 
 # ---------------------------------------------------------------------------------------------- configuration
-def test_config_from_env_and_defaults(tmp_path):
+def test_config_from_env_and_defaults(tmp_path, monkeypatch):
     c = SessionConfig.from_env({"MAMEMCP_MAME_DIR": "D:/x/mame", "MAMEMCP_ROMPATH": "D:/a;D:/b;", "MAMEMCP_RUNS_DIR": str(tmp_path)})
-    assert c.mame_exe == Path("D:/x/mame/mame.exe") and c.rompaths == [Path("D:/a"), Path("D:/b")] and c.runs_dir == tmp_path
+    assert c.mame_exe == Path("D:/x/mame") / launcher.MAME_EXE_NAME and c.rompaths == [Path("D:/a"), Path("D:/b")] and c.runs_dir == tmp_path
+    monkeypatch.setattr(launcher, "default_mame_exe", lambda: tmp_path / "nowhere" / launcher.MAME_EXE_NAME)
     d = SessionConfig.from_env({})
-    assert d.rompaths == [d.mame_dir / "roms"] and d.runs_dir.name == "sessions"
+    assert d.mame_exe == tmp_path / "nowhere" / launcher.MAME_EXE_NAME
+    assert d.rompaths == [tmp_path / "nowhere" / "roms"] and d.runs_dir.name == "sessions"
+
+
+def test_config_executable_from_env_takes_precedence_and_bare_names_use_path(tmp_path, monkeypatch):
+    exe = tmp_path / "bin" / "mame"
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: str(exe) if name == "mame" else None)
+    c = SessionConfig.from_env({"MAMEMCP_MAME_EXE": "mame", "MAMEMCP_MAME_DIR": "D:/x/mame", "MAMEMCP_ROMPATH": "/r",
+                                "MAMEMCP_MAME_PLUGINS": "/usr/share/games/mame/plugins"})
+    assert c.mame_exe == exe.resolve() and c.mame_plugins == Path("/usr/share/games/mame/plugins")
+    assert c.public()["mame_plugins"] == str(Path("/usr/share/games/mame/plugins"))
+    assert SessionConfig.from_env({"MAMEMCP_MAME_EXE": str(tmp_path / "m"), "MAMEMCP_ROMPATH": "/r"}).mame_exe == tmp_path / "m"
+
+
+def test_resource_folders_come_from_next_to_the_executable_without_asking_mame(tmp_path, monkeypatch):
+    """The Windows layout: plugins and roms next to the executable; MAME's configuration is never consulted."""
+    (tmp_path / "plugins").mkdir()
+    (tmp_path / "plugins" / "boot.lua").write_text("")
+    (tmp_path / "roms").mkdir()
+    exe = tmp_path / launcher.MAME_EXE_NAME
+    exe.write_bytes(b"stub")
+    monkeypatch.setattr(launcher, "_SHOWCONFIG", {})
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **k: pytest.fail("MAME was run"))
+    assert launcher.mame_plugins_dir(exe) == tmp_path / "plugins" and launcher.default_rompaths(exe) == [tmp_path / "roms"]
+
+
+def test_packaged_layout_takes_resource_folders_from_mames_own_configuration(tmp_path, monkeypatch):
+    """A packaged Linux MAME: /usr/games/mame with plugins and roms elsewhere, found through -showconfig."""
+    exe = tmp_path / "games" / "mame"
+    exe.parent.mkdir()
+    exe.write_bytes(b"stub")
+    share = tmp_path / "share" / "plugins"
+    share.mkdir(parents=True)
+    (share / "boot.lua").write_text("")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    seen = []
+
+    class R:
+        stdout = (f"homepath                  .\nrompath                   $HOME/mame/roms;{tmp_path}/share/roms\n"
+                  f"pluginspath               {tmp_path}/empty;{share}\n")
+
+    def run(cmd, **kw):
+        seen.append(cmd)
+        return R()
+
+    monkeypatch.setattr(launcher, "_SHOWCONFIG", {})
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    assert launcher.mame_plugins_dir(exe) == share
+    assert launcher.default_rompaths(exe) == [tmp_path / "home" / "mame" / "roms", tmp_path / "share" / "roms"]
+    assert seen == [[str(exe), "-showconfig"]]  # read once per executable
+    cmd = launcher.build_command(mame_exe=exe, system="shinobi", rompath=tmp_path, run_dir=tmp_path / "run", port=1,
+                                 plugins_dir=share)
+    assert cmd[cmd.index("-pluginspath") + 1] == f"{launcher._fwd(launcher.PLUGIN_DIR)};{launcher._fwd(share)}"
+
+
+def test_ownership_accepts_a_configured_executable_reached_through_a_symlink(tmp_path):
+    real = tmp_path / "real" / "mame"
+    real.parent.mkdir()
+    real.write_bytes(b"stub")
+    link = tmp_path / "mame-link"
+    try:
+        link.symlink_to(real)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    r = Rig(tmp_path)
+    r.cfg.exe = link
+    r.mgr.start("shinobi")
+    r.ident.images[r.procs[0].pid] = str(real)  # what /proc/<pid>/exe reports: the resolved image
+    rep = r.mgr.stop()
+    assert rep["process"]["terminated"] is True and "refused" not in rep["process"]
+
+
+# ---------------------------------------------------------------------------------------------- wrapper / runtime identity
+ELF_STUB = b"\x7fELF" + b"\0" * 12
+
+
+def _wrapper_rig(tmp_path, *, runtime="configured"):
+    """A launch command that is a `#!` wrapper script and a separate ELF-looking runtime (stub files; nothing is executed)."""
+    r = Rig(tmp_path)
+    wrapper = tmp_path / "bin" / "mame"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/bin/sh\nexec /somewhere/else \"$@\"\n")
+    rt = tmp_path / "lib" / "mame-real"
+    rt.parent.mkdir()
+    rt.write_bytes(ELF_STUB)
+    r.cfg.exe = wrapper
+    if runtime == "configured":
+        r.cfg.runtime = rt
+    r.rt = rt
+    return r
+
+
+def test_wrapper_launch_with_configured_runtime_is_owned_by_the_runtime_image_only(tmp_path):
+    r = _wrapper_rig(tmp_path)
+    r.mgr.start("shinobi")
+    pid = r.procs[0].pid
+    assert r.launches[0]["mame_exe"] == r.cfg.exe  # launched through the wrapper, which keeps its own setup behaviour
+    rep = r.mgr.stop()
+    assert rep["process"]["terminated"] is True and "refused" not in rep["process"]
+
+
+def test_wrapper_image_is_not_accepted_as_the_runtime(tmp_path):
+    r = _wrapper_rig(tmp_path)
+    r.mgr.start("shinobi")
+    r.ident.images[r.procs[0].pid] = str(r.cfg.exe)  # still the wrapper: not the established runtime
+    rep = r.mgr.stop()
+    assert rep["process"]["terminated"] is False and "not the expected MAME runtime" in rep["process"]["refused"]
+
+
+def test_unrelated_executable_is_refused_at_readiness_and_the_launched_process_is_stopped(tmp_path):
+    r = _wrapper_rig(tmp_path)
+    r.ident.image = lambda pid: "/bin/sh"
+    with pytest.raises(BridgeError) as e:
+        r.mgr.start("shinobi")
+    assert e.value.code == "process_identity_mismatch"
+
+
+def test_unrelated_port_owner_is_refused_at_readiness(tmp_path):
+    r = Rig(tmp_path)
+    orig = r._launch
+
+    def launch(**kw):
+        p, info = orig(**kw)
+        r.ident.owners[kw["port"]] = {p.pid + 1000}
+        return p, info
+    r.mgr._launch = launch
+    with pytest.raises(BridgeError) as e:
+        r.mgr.start("shinobi")
+    assert e.value.code == "bridge_owner_mismatch"
+
+
+def test_creation_time_mismatch_is_refused_at_readiness(tmp_path):
+    r = Rig(tmp_path)
+    orig = r._launch
+
+    def launch(**kw):
+        p, info = orig(**kw)
+        r.ident.created_map[p.pid] = 1
+        return p, info
+    r.mgr._launch = launch
+    with pytest.raises(BridgeError) as e:
+        r.mgr.start("shinobi")
+    assert e.value.code == "process_identity_mismatch"
+
+
+def test_wrapper_without_an_established_runtime_is_refused_before_anything_is_launched(tmp_path):
+    r = _wrapper_rig(tmp_path, runtime=None)
+    with pytest.raises(BridgeError) as e:
+        r.mgr.start("shinobi")
+    assert e.value.code == "runtime_unverified" and "MAMEMCP_MAME_RUNTIME" in e.value.message and r.launches == []
+
+
+def test_configured_runtime_must_be_an_elf_file_and_cannot_redirect_a_plain_executable(tmp_path):
+    r = _wrapper_rig(tmp_path)
+    (tmp_path / "lib" / "notelf").write_bytes(b"hello")
+    with pytest.raises(launcher.RuntimeIdentityError):
+        launcher.runtime_executable(r.cfg.exe, tmp_path / "lib" / "notelf")
+    with pytest.raises(launcher.RuntimeIdentityError):
+        launcher.runtime_executable(r.rt, tmp_path / "bin" / "mame")  # r.rt is not a script: a different runtime is a mismatch
+    assert launcher.runtime_executable(r.rt) == r.rt.resolve()
+
+
+def test_runtime_from_env_and_symlinked_wrapper(tmp_path):
+    c = SessionConfig.from_env({"MAMEMCP_MAME_RUNTIME": "/usr/lib/mame/mame", "MAMEMCP_MAME_EXE": str(tmp_path / "m")})
+    assert c.runtime == Path("/usr/lib/mame/mame")
+
+
+def test_debian_discovery_requires_the_same_dpkg_package_and_root_protection(tmp_path, monkeypatch):
+    wrapper = tmp_path / "usr-games" / "mame"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/bin/sh\n")
+    cand = Path("/usr/lib/mame/mame")
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher, "_root_protected", lambda p: True)
+    monkeypatch.setattr(Path, "is_file", lambda self: True if self == cand else Path.stat(self) is not None)
+    monkeypatch.setattr(launcher, "_is_elf", lambda p: True)
+    monkeypatch.setattr(launcher.os.path, "realpath", lambda p: str(p))
+    monkeypatch.setattr(launcher, "_dpkg_packages", lambda *p: {"mame"})
+    assert launcher.runtime_executable(wrapper) == cand
+    monkeypatch.setattr(launcher, "_dpkg_packages", lambda *p: {"mame"} if p[0] == wrapper else {"other"})
+    with pytest.raises(launcher.RuntimeIdentityError):
+        launcher.runtime_executable(wrapper)
+    monkeypatch.setattr(launcher, "_dpkg_packages", lambda *p: None)
+    with pytest.raises(launcher.RuntimeIdentityError):
+        launcher.runtime_executable(wrapper)
+    monkeypatch.setattr(launcher, "_dpkg_packages", lambda *p: {"mame"})
+    monkeypatch.setattr(launcher, "_root_protected", lambda p: p != cand)  # a runtime others can write is not trusted
+    with pytest.raises(launcher.RuntimeIdentityError):
+        launcher.runtime_executable(wrapper)
 
 
 # ---------------------------------------------------------------------------------------------- launcher hygiene
@@ -467,7 +659,7 @@ def test_launcher_never_passes_test_hooks_or_fixture_into_production(monkeypatch
         pid = 1
 
     def popen(cmd, **kw):
-        seen["cmd"], seen["env"], seen["stdin"] = cmd, kw["env"], kw.get("stdin")
+        seen["cmd"], seen["env"], seen["stdin"], seen["kw"] = cmd, kw["env"], kw.get("stdin"), kw
         return P()
 
     monkeypatch.setattr(launcher.subprocess, "Popen", popen)
@@ -481,6 +673,49 @@ def test_launcher_never_passes_test_hooks_or_fixture_into_production(monkeypatch
     assert "mamemcp_fixture" not in " ".join(seen["cmd"]) and "-debug" in seen["cmd"]
     assert seen["env"]["MAMEMCP_PORT"] == "5555" and seen["stdin"] == subprocess.DEVNULL
     assert info["test_env"] == {}
+    # POSIX keeps the inherited SIG_IGN for SIGPIPE/SIGXFSZ (see the regression test below); Windows passes nothing extra
+    assert ("restore_signals" in seen["kw"]) is (sys.platform != "win32")
+    assert seen["kw"].get("restore_signals", True) is (sys.platform == "win32")
+
+
+# A stand-in for MAME (launched exactly like it, through launcher.launch): it reports the SIGPIPE disposition it inherited
+# and then writes 1 MB into a pipe whose reader has already exited. It changes no signal handling itself, so it keeps whatever
+# disposition it was given, which is what a MAME build that does not ignore SIGPIPE does.
+_CLOSED_PIPE_WRITER = """#!/bin/sh
+grep -E '^SigIgn' /proc/self/status
+exec 3>&1
+{ head -c 1048576 /dev/zero; echo "writer_status=$?" >&3; } | true
+"""
+
+
+def _sigpipe_ignored(sigign_line: str) -> bool:
+    return bool(int(sigign_line.split(":")[1].strip(), 16) & (1 << 12))  # SIGPIPE = 13 -> bit 12
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX signal inheritance, read from /proc")
+def test_launched_child_survives_a_closed_pipe_write_with_a_write_error(monkeypatch, tmp_path):
+    writer = tmp_path / "fake-mame"
+    writer.write_text(_CLOSED_PIPE_WRITER)
+    writer.chmod(0o755)
+    import signal
+    assert signal.getsignal(signal.SIGPIPE) == signal.SIG_IGN  # the launching Python ignores SIGPIPE (CPython startup)
+
+    # control: the default Popen policy hands the same child SIGPIPE at SIG_DFL, and the write kills the writer (128 + 13)
+    ctl = subprocess.run([str(writer)], capture_output=True, text=True, timeout=30)
+    ctl_sig = next(l for l in ctl.stdout.splitlines() if l.startswith("SigIgn"))
+    assert not _sigpipe_ignored(ctl_sig) and "writer_status=141" in ctl.stdout, ctl.stdout + ctl.stderr
+
+    # corrected launch policy: launcher.launch with a real Popen
+    monkeypatch.setattr(launcher, "mame_version", lambda e: "0.289")
+    monkeypatch.setattr(launcher, "verify_roms", lambda *a: {"returncode": 0, "output": "good"})
+    monkeypatch.setattr(launcher, "listxml_roms", lambda *a: {})
+    proc, info = launcher.launch(system="shinobi", port=5555, run_dir=tmp_path / "run", mame_exe=writer,
+                                 plugins_dir=tmp_path, rompath=tmp_path)
+    assert proc.wait(timeout=30) == 0
+    out = (Path(info["run_dir"]) / "mame_stdout.txt").read_text()
+    sig = next(l for l in out.splitlines() if l.startswith("SigIgn"))
+    assert _sigpipe_ignored(sig), out
+    assert "writer_status=1" in out.splitlines() and "Broken pipe" in out, out  # EPIPE write error, process still running
 
 
 # ------------------------------------------------------------------------------------------------ startup readiness
