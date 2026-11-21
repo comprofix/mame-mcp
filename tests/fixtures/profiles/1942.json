@@ -37,7 +37,7 @@
     },
     "attract_mode_pc_note": "300 PC samples all fell in 0x0000-0x0FFF (frame-wait loop near 0x91-0x9A): the window is not executed, so a changed bank is safe while it is held",
     "unequal_rates": {
-      "note": "Z80 :maincpu. hot = per-frame RST 10h handler (about 60/s); rare = instruction after 'ld (hl),1' at 0x2BA0 (selects bank entry 1, from docs/research_1942_banks.md; observed a few times per several seconds in attract mode). Observers sit at the next instruction boundary of each.",
+      "note": "Z80 :maincpu. hot = per-frame RST 10h handler (about 60/s); rare = instruction after 'ld (hl),1' at 0x2BA0 (selects bank entry 1; observed a few times per several seconds in attract mode). Observers sit at the next instruction boundary of each.",
       "hot": {
         "address": "0x11",
         "observer_address": "0x12"

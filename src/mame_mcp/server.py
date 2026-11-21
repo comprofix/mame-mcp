@@ -12,7 +12,7 @@ Optional EXTERNAL attachment (compatibility; not owned by this server, never sta
   MAMEMCP_PORT         bridge port of an already-running MAME with the mamemcp plugin. Without it nothing is
                        attached implicitly and bridge tools report `no_session` until start_session.
   MAMEMCP_MAME_PID     optional PID of that MAME to nudge (WM_NULL) while a request waits; Windows only, opt-in
-                       (see docs/VALIDATION.md). Only a process whose image is named mame*.exe is ever nudged.
+                       (see winwake.py). Only a process whose image is named mame*.exe is ever nudged.
   MAMEMCP_LAUNCH_INFO  optional launch.json of that MAME (adds ROM hashes / -verifyroms to session_info)
 A managed session takes precedence while it exists; after stop_session external attachment resumes.
 """

@@ -2315,7 +2315,7 @@ function exports.startplugin()
 	---------------------------------------------------------------------------
 	-- checkpoints: save / load machine state (session-owned files)
 	---------------------------------------------------------------------------
-	-- API choice (verified against the MAME 0.289 source and the real binary, docs/VALIDATION.md):
+	-- API choice (verified against the MAME 0.289 source and the real binary):
 	--   * Lua machine:save()/load() are only SCHEDULED, report nothing, and never complete while emulation is stopped in the
 	--     debugger. buffer_save/buffer_load are marked broken upstream. Not used as the primary path.
 	--   * The debugger's 'statesave'/'stateload' call running_machine::immediate_save/immediate_load, which are synchronous

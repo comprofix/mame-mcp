@@ -15,8 +15,11 @@ dist/
 .coverage.*
 htmlcov/
 
-# Generated validation/research output (scripts write to runs\<suite>\ and runs\<timestamp>\)
+# Generated validation and session output (harnesses write to runs\<suite>\, MCP sessions to runs\sessions\, hand launches to runs\<timestamp>\)
 runs/
+
+# One-off research workspace: scripts written for a specific ROM or research question, and their output
+/research/
 
 # Logs and scratch
 *.log

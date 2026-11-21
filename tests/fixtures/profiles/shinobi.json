@@ -63,7 +63,7 @@
     "tag": ":soundcpu",
     "cpu": "Z80",
     "hot_pc": "0xAE6",
-    "hot_note": "idle loop 0xAE4..0xAEA, found by sampling PC 120 times on this ROM set (scripts note: runs/zprobe)",
+    "hot_note": "idle loop 0xAE4..0xAEA, found by sampling PC 120 times on this ROM set",
     "loop_range": [
       "0xAE4",
       "0xAEA"
