@@ -444,10 +444,16 @@ class SessionManager(StateOperations):
                 failures.append("capture cleanup was not verified; stopping MAME discards its breakpoints regardless")
         elif prior == READY:
             report["input_cleanup"] = report["capture_cleanup"] = {"skipped": "MAME was not running"}
+        # Prove ownership BEFORE the bridge connection is closed. MAME's socket on the bridge port is the evidence of who owns the
+        # port, and when the client closes while a plugin heartbeat byte is still unread, Windows resets the connection and that
+        # socket disappears within about a millisecond; checking afterwards made stop_session refuse to stop its own MAME.
+        verdict = None
+        if s.proc is not None and s.proc.poll() is None:
+            verdict = self._verify_owned(s, check_port=(prior == READY))
         if s.client is not None:
             s.client.close(graceful=False)
         if s.proc is not None:
-            report["process"] = self._terminate(s, check_port=(prior == READY))
+            report["process"] = self._terminate(s, check_port=(prior == READY), preverified=verdict)
             if report["process"].get("refused"):
                 failures.append("process was NOT stopped: " + report["process"]["refused"])
             elif report["process"].get("still_running"):
@@ -492,23 +498,60 @@ class SessionManager(StateOperations):
             return False, f"image '{img}' is not the configured MAME executable"
         if s.created is not None and self._ident.created(s.pid) != s.created:
             return False, "creation time differs from the recorded one (recycled pid)"
-        if check_port and s.pid not in self._ident.port_owners(s.port):
-            return False, f"pid does not own bridge port {s.port}"
-        return True, "image, creation time and bridge port verified"
+        if not check_port:
+            return True, "image and creation time verified (bridge port not checked)"
+        owners = self._ident.port_owners(s.port)
+        if s.pid in owners:
+            return True, "image, creation time and bridge port verified"
+        if owners:  # another process holds the bridge port: this pid is not (or no longer) what the bridge talks to
+            return False, f"pid does not own bridge port {s.port} (held by pid {sorted(owners)})"
+        if s.created is None:
+            return False, f"pid does not own bridge port {s.port} (nothing holds it, and no creation time was recorded to identify the process exactly)"
+        # Nothing holds the port: the bridge connection was already reset and the plugin has not re-listened yet. The process is
+        # still identified exactly (Popen handle, configured image, recorded creation time) and nothing else owns the port.
+        return True, ("image and creation time verified; no process currently holds the bridge port (the connection was reset "
+                      "and the plugin has not re-listened yet), and no other process owns it")
 
-    def _terminate(self, s: Session, *, check_port: bool) -> dict[str, Any]:
+    def _terminate(self, s: Session, *, check_port: bool, preverified: tuple[bool, str] | None = None) -> dict[str, Any]:
+        """Stop the owned process after verifying it is the one this session launched.
+
+        `preverified` is the verdict of `_verify_owned` taken EARLIER, while the bridge connection was still open (the only time
+        bridge-port ownership can be observed reliably); it is then re-checked here for what is still observable (image and
+        creation time) so an identity change in between is caught. Termination goes through the Popen handle, which on Windows
+        keeps the pid from being reused while it is open. A process that exits at any point before the terminate call is
+        reported as exited (exited_before_termination), not as a refusal and not as something this server terminated."""
         proc = s.proc
         out: dict[str, Any] = {"pid": s.pid, "was_running": False, "terminated": False, "exit_code": None}
-        rc = proc.poll()
-        if rc is not None:
-            out["exit_code"] = s.exit_code = rc
+
+        def _exited() -> bool:
+            rc_now = proc.poll()
+            if rc_now is None:
+                return False
+            out["exit_code"] = s.exit_code = rc_now
+            return True
+
+        if _exited():
+            if preverified is not None:  # it was alive when its identity was checked and has exited since: nothing was terminated by us
+                out["was_running"], out["exited_before_termination"] = True, True
             return out
         out["was_running"] = True
-        ok, why = self._verify_owned(s, check_port=check_port)
-        out["identity_check"] = why
+        if preverified is None:
+            ok, why = self._verify_owned(s, check_port=check_port)
+        else:
+            ok, why = preverified
+            if ok:
+                ok2, why2 = self._verify_owned(s, check_port=False)
+                if not ok2:
+                    ok, why = False, f"identity changed between verification and termination: {why2} (verified earlier: {why})"
         if not ok:
+            if _exited():  # it went away while it was being verified (an unreadable image is then expected)
+                out["exited_before_termination"] = True
+                out["identity_check"] = f"not checked to completion: the process exited meanwhile ({why})"
+                return out
+            out["identity_check"] = why
             out["refused"] = why  # an unverified process is never terminated
             return out
+        out["identity_check"] = why
         try:
             proc.terminate()
             try:

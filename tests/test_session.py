@@ -528,3 +528,144 @@ def test_start_exits_the_wait_if_mame_dies_while_loading(tmp_path, monkeypatch):
     with pytest.raises(BridgeError) as e:
         r.mgr.start("shinobi", ready_timeout=5)
     assert e.value.code == "mame_exited_during_startup"
+
+
+# ---------------------------------------------------------------------------------------------- shutdown ordering and identity races
+class ResetOnCloseClient(FakeClient):
+    """Models what was measured on Windows with real MAME 0.289: when the client closes while a plugin heartbeat byte is still
+    unread, the connection is RESET and MAME's socket on the bridge port disappears within about a millisecond. The fake process
+    table therefore loses the port owner the instant the client closes."""
+
+    def __init__(self, ident, port, **kw):
+        super().__init__(**kw)
+        self.ident, self.port = ident, port
+        self.owned_when_asked = []
+
+    def close(self, graceful=True):
+        self.ident.owners.pop(self.port, None)
+        super().close(graceful)
+
+
+class ResetRig(Rig):
+    def __init__(self, tmp_path, **kw):
+        super().__init__(tmp_path, **kw)
+        orig = self.ident.port_owners
+        self.ident.port_owners = lambda port: (self.checks.append(bool(self.clients and self.clients[-1].connected)), orig(port))[1]
+        self.checks = []  # for each port-ownership lookup: was the bridge connection still open?
+
+    def _client(self, port, pid, created):
+        c = ResetOnCloseClient(self.ident, port, **self.client_kw)
+        self.clients.append(c)
+        return c
+
+
+def test_stop_proves_ownership_while_the_bridge_is_still_open_and_survives_the_reset(tmp_path):
+    rig = ResetRig(tmp_path)
+    rig.mgr.start("shinobi")
+    rig.checks.clear()
+    r = rig.mgr.stop()
+    assert r["process"]["terminated"] is True and "refused" not in r["process"] and r["cleanup_failures"] == []
+    assert r["process"]["identity_check"] == "image, creation time and bridge port verified"
+    assert rig.checks == [True]  # the one stop-time lookup happened before the client closed
+    assert rig.clients[0].log[-1] == "close" and rig.procs[0].calls == ["terminate"]
+
+
+def test_server_shutdown_uses_the_same_ordering(tmp_path):
+    rig = ResetRig(tmp_path)
+    rig.mgr.start("shinobi")
+    rig.checks.clear()
+    rep = rig.mgr.shutdown()
+    assert rep["process"]["terminated"] is True and rep["cleanup_failures"] == []
+    assert rep["process"]["identity_check"] == "image, creation time and bridge port verified" and rig.checks == [True]
+
+
+def test_another_process_holding_the_port_still_refuses_with_the_holder_named(rig):
+    rig.mgr.start("shinobi")
+    rig.ident.owners[5555] = {1234}
+    r = rig.mgr.stop()
+    assert rig.procs[0].calls == [] and "held by pid [1234]" in r["process"]["refused"]
+
+
+def test_already_reset_connection_falls_back_on_exact_identity_and_says_so(rig):
+    rig.mgr.start("shinobi")
+    rig.ident.owners.pop(5555)  # the connection was reset earlier and nobody holds the port now
+    r = rig.mgr.stop()
+    assert r["process"]["terminated"] is True and "no process currently holds the bridge port" in r["process"]["identity_check"]
+
+
+def test_no_owner_and_no_recorded_creation_time_is_refused(rig):
+    orig = rig._launch
+    rig.mgr._launch = lambda **kw: (lambda p_i: (p_i[0], {**p_i[1], "pid_created_filetime": None}))(orig(**kw))
+    rig.mgr.start("shinobi")
+    rig.ident.owners.pop(5555)
+    r = rig.mgr.stop()
+    assert rig.procs[0].calls == [] and "no creation time was recorded" in r["process"]["refused"]
+
+
+def test_process_exiting_while_it_is_verified_is_reported_as_exited_not_refused(rig):
+    rig.mgr.start("shinobi")
+    p = rig.procs[0]
+
+    def vanishing_image(pid):
+        p.rc = 3  # exits between poll() and the image lookup
+        return None
+
+    rig.ident.image = vanishing_image
+    r = rig.mgr.stop()
+    assert r["process"].get("exited_before_termination") is True and r["process"]["was_running"] is True
+    assert "refused" not in r["process"] and r["process"]["exit_code"] == 3
+    assert p.calls == [] and not any("NOT stopped" in f for f in r["cleanup_failures"]) and r["stopped"] is True
+
+
+def test_identity_change_between_verification_and_termination_is_refused(rig):
+    rig.mgr.start("shinobi")
+    asked = []
+
+    def created(pid):
+        asked.append(pid)
+        return 777 if len(asked) == 1 else 999  # the second look (just before terminate) sees a different process
+
+    rig.ident.created = created
+    r = rig.mgr.stop()
+    assert rig.procs[0].calls == [] and "identity changed between verification and termination" in r["process"]["refused"]
+    assert any("NOT stopped" in f for f in r["cleanup_failures"])
+
+
+def test_process_exit_between_verification_and_the_terminate_call_is_handled(tmp_path):
+    class ExitsBeforeTerminate(FakeProc):
+        def terminate(self):
+            self.calls.append("terminate")
+            self.rc = 0
+            raise PermissionError("access denied: the process had already exited")
+
+    rig = Rig(tmp_path)
+    rig.mgr._launch = lambda **kw: (lambda p_i: (p_i[0], p_i[1]))(_launch_with(rig, ExitsBeforeTerminate, kw))
+    rig.mgr.start("shinobi")
+    r = rig.mgr.stop()
+    assert r["stopped"] is True and r["process"]["terminated"] is True and r["process"]["exit_code"] == 0 and not r["process"].get("still_running")
+
+
+def _launch_with(rig, proc_cls, kw):
+    rig.launches.append(kw)
+    p = proc_cls()
+    rig.procs.append(p)
+    rig.ident.images[p.pid] = str(rig.cfg.mame_exe)
+    rig.ident.created_map[p.pid] = 777
+    rig.ident.owners[kw["port"]] = {p.pid}
+    return p, {"pid_created_filetime": 777, "romset_zip": {"sha1": "abc"}, "verifyroms": {"output": "romset shinobi is good"}}
+
+
+def test_input_cleanup_failure_is_reported_and_the_process_is_still_stopped(tmp_path):
+    class InputTimeout(ResetOnCloseClient):
+        def request(self, op, *a, **kw):
+            if op == "input_cancel":
+                raise BridgeError("request_timeout", "slow", uncertain=True)
+            return super().request(op, *a, **kw)
+
+    rig = ResetRig(tmp_path)
+    rig.mgr._client_factory = lambda port, pid, created: (rig.clients.append(InputTimeout(rig.ident, port)), rig.clients[-1])[1]
+    rig.mgr.start("shinobi")
+    r = rig.mgr.stop()
+    assert r["input_cleanup"]["released"] is False and r["input_cleanup"]["error"]["code"] == "request_timeout"
+    assert any("held inputs were not confirmed released" in f for f in r["cleanup_failures"])
+    assert r["process"]["terminated"] is True and r["process"]["identity_check"] == "image, creation time and bridge port verified"
