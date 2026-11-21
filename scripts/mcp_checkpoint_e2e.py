@@ -1,6 +1,6 @@
 """Checkpoint / RAM-write / input workflow through the OFFICIAL MCP SDK client against the production server and real
 MAME 0.289 (Shinobi). One server process (`python -I -m mame_mcp.server`), MCP tools only, no fixture plugin and no
-test hooks. This is HARNESS evidence; a later live Claude Code run is a separate test (see docs/VALIDATION.md).
+test hooks. This is a harness run; a live Claude Code session is a separate test.
 
   A  tool surface; refusals with no session
   B  the target flow: start -> input -> save -> change -> load -> verify restoration -> capture -> stop
@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fx import Results, body_of, code_of  # noqa: E402
+from _fx import EXPECTED_TOOLS, MAME_DIR, ROMPATH, Results, body_of, code_of  # noqa: E402
 
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
@@ -34,8 +34,6 @@ from mcp.client.stdio import stdio_client  # noqa: E402
 from mame_mcp import winwake  # noqa: E402
 from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 
-MAME_DIR = r"D:\arcade\mame"
-ROMPATH = r"D:\arcade\mame\roms"
 OUT = PROJECT_ROOT / "runs" / "mcp_checkpoint_e2e"
 PROFILE = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "shinobi.json").read_text())
 CI = PROFILE["checkpoint_input"]
@@ -47,15 +45,11 @@ RAM, ROM, UNM, DEV = (H(CI[k]["address"]) for k in ("ram", "rom", "unmapped", "d
 PRESS = CI["input"]["press"]
 R = Results("mcp_checkpoint_e2e")
 check, note = R.check, R.note
-EXPECTED_TOOLS = sorted([
-    "start_session", "stop_session", "session_info", "read_memory", "read_registers", "capture_breakpoint", "experiment_status",
-    "cancel_experiment", "execution_control", "list_inputs", "press_inputs", "release_inputs", "save_checkpoint", "load_checkpoint",
-    "list_checkpoints", "write_memory"])
 
 
 def server_env() -> dict[str, str]:
     # a hostile ambient environment: the production session must not inherit any of these
-    return {"SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "MAMEMCP_MAME_DIR": MAME_DIR, "MAMEMCP_ROMPATH": ROMPATH, "MAMEMCP_RUNS_DIR": str(OUT / "sessions"),
+    return {"SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "MAMEMCP_MAME_DIR": str(MAME_DIR), "MAMEMCP_ROMPATH": str(ROMPATH), "MAMEMCP_RUNS_DIR": str(OUT / "sessions"),
             "MAMEMCP_TEST_FORCE_SCHEDULED_CHECKPOINT": "1", "MAMEMCP_TEST_FAIL_CLEAR": "1", "MAMEMCP_STATE_DIR": str(OUT / "ambient_state_dir")}
 
 

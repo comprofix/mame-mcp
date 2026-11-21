@@ -11,10 +11,13 @@ import sys
 import time
 from pathlib import Path
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _fx import EXPECTED_TOOLS, launch_mame  # noqa: E402
 
-from mame_mcp.launcher import PROJECT_ROOT, launch
+from mcp import ClientSession, StdioServerParameters  # noqa: E402
+from mcp.client.stdio import stdio_client  # noqa: E402
+
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 
 PORT = 9455
 OUT = PROJECT_ROOT / "runs" / "mcp_e2e"
@@ -35,7 +38,7 @@ def payload(res) -> dict:
 
 
 async def main() -> int:
-    proc, info = launch(port=PORT, run_dir=OUT / "run")
+    proc, info = launch_mame(system="shinobi", port=PORT, run_dir=OUT / "run")
     params = StdioServerParameters(
         command=sys.executable, args=["-I", "-m", "mame_mcp.server"],
         env={"MAMEMCP_PORT": str(PORT), "MAMEMCP_LAUNCH_INFO": str(OUT / "run" / "launch.json"),
@@ -48,9 +51,7 @@ async def main() -> int:
                 init = await s.initialize()
                 tools = await s.list_tools()
                 names = sorted(t.name for t in tools.tools)
-                check("MCP initialize + list_tools", names == sorted(["session_info", "read_memory", "read_registers", "capture_breakpoint",
-                      "experiment_status", "cancel_experiment", "execution_control", "start_session", "stop_session", "list_inputs", "press_inputs",
-                      "release_inputs", "save_checkpoint", "load_checkpoint", "list_checkpoints", "write_memory"]), tools=names)
+                check("MCP initialize + list_tools", names == EXPECTED_TOOLS, tools=names)
                 check("no arbitrary lua/shell/debugger-command tool exposed",
                       not any(k in n for n in names for k in ("lua", "shell", "exec_", "command", "eval")))
 

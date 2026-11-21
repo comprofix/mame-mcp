@@ -1,4 +1,5 @@
-"""Helpers shared by the hardening validation scripts (test-only)."""
+"""Helpers shared by the maintained regression harnesses (test-only): the environment they run against, the
+fixture-plugin client and result recording."""
 from __future__ import annotations
 
 import json
@@ -6,6 +7,27 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+
+from mame_mcp import launcher
+
+# The environment every maintained harness runs against. It is fixed here, not read from the ambient environment, so a
+# stray MAME_DIR / MAMEMCP_* variable cannot silently point a run at a different MAME or ROM collection. Both are only read.
+MAME_DIR = Path(r"D:\arcade\mame")       # holds mame.exe (MAME 0.289)
+ROMPATH = Path(r"D:\arcade\mame\ROMS")   # the ROM collection (1942, 1944, 1943kai and shinobi are used)
+
+# The MCP tool surface the server must advertise: exactly these typed tools, no Lua / shell / debugger-command tool.
+EXPECTED_TOOLS = sorted([
+    "start_session", "stop_session", "session_info", "read_memory", "read_registers", "capture_breakpoint", "experiment_status",
+    "cancel_experiment", "execution_control", "list_inputs", "press_inputs", "release_inputs", "save_checkpoint", "load_checkpoint",
+    "list_checkpoints", "write_memory", "list_screens", "capture_screenshot", "capture_watchpoint", "disassemble_memory", "press_sequence"])
+
+
+def launch_mame(**kw):
+    """mame_mcp.launcher.launch against MAME_DIR / ROMPATH. `system` is always given by the caller; an explicit `mame_dir` or
+    `rompath` (a deliberately different ROM directory) still wins."""
+    kw.setdefault("mame_dir", MAME_DIR)
+    kw.setdefault("rompath", ROMPATH)
+    return launcher.launch(**kw)
 
 
 class Fixture:

@@ -25,12 +25,12 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fx import Fixture, Results  # noqa: E402
+from _fx import Fixture, Results, launch_mame  # noqa: E402
 from validate_hardening import Ctx, wait_for  # noqa: E402
 
 from mame_mcp import winwake  # noqa: E402
 from mame_mcp.bridge import BridgeClient  # noqa: E402
-from mame_mcp.launcher import PROJECT_ROOT, launch  # noqa: E402
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 from mame_mcp.protocol import MAX_LOCATIONS, BridgeError, capture_args  # noqa: E402
 
 OUT = PROJECT_ROOT / "runs" / "multi"
@@ -38,7 +38,6 @@ PORT, PORT_F, PORT_S, PORT_C, PORT_D = 9457, 9459, 9463, 9464, 9465
 PROFILE_1942 = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "1942.json").read_text())["maincpu"]["unequal_rates"]
 PROFILE_SHIN = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "shinobi.json").read_text())["maincpu"]
 H = lambda v: int(v, 16)  # noqa: E731
-ROMS = Path(r"D:\arcade\mame\roms")
 CPU = ":maincpu"
 HOT, IRQ8, RARE, SPIN, NEVER = 0x11, 0x08, 0x38, 0x98, 0x166
 R = Results("multi")
@@ -506,7 +505,7 @@ def main() -> int:
         test_env = dict(test_env or {})
         if inject:
             test_env["MAMEMCP_TEST_FAIL_INSTALL_AT"] = str(inject)
-        p, i = launch(system=system, port=port, run_dir=OUT / run, rompath=ROMS if system == "1942" else None, fixture=True, test_env=test_env)
+        p, i = launch_mame(system=system, port=port, run_dir=OUT / run, fixture=True, test_env=test_env)
         created = winwake.creation_time(p.pid)
         w = winwake.waker_for(lambda: (p.pid, created), port=port)
         fx = Fixture(i["fixture_dir"], wake=w)

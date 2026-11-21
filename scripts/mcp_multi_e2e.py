@@ -14,14 +14,16 @@ import sys
 import time
 from pathlib import Path
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _fx import launch_mame  # noqa: E402
 
-from mame_mcp.launcher import PROJECT_ROOT, launch
+from mcp import ClientSession, StdioServerParameters  # noqa: E402
+from mcp.client.stdio import stdio_client  # noqa: E402
+
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 
 PORT = 9461
 OUT = PROJECT_ROOT / "runs" / "mcp_multi_e2e"
-ROMS = Path(r"D:\arcade\mame\roms")
 RESULTS: list[dict] = []
 
 
@@ -48,7 +50,7 @@ async def wait_done(s, exp, timeout=40):
 
 
 async def main() -> int:
-    proc, info = launch(system="1942", port=PORT, run_dir=OUT / "run", rompath=ROMS)
+    proc, info = launch_mame(system="1942", port=PORT, run_dir=OUT / "run")
     params = StdioServerParameters(command=sys.executable, args=["-I", "-m", "mame_mcp.server"],
                                    env={"MAMEMCP_PORT": str(PORT), "MAMEMCP_LAUNCH_INFO": str(OUT / "run" / "launch.json"), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")})
     errlog = open(OUT / "server_stderr.txt", "w")
@@ -58,8 +60,9 @@ async def main() -> int:
                 await s.initialize()
                 tools = {t.name: t for t in (await s.list_tools()).tools}
                 props = tools["capture_breakpoint"].input_schema["properties"]
-                check("MCP: capture_breakpoint advertises `locations` and still `address`; no watchpoint/command/eval/lua tool (the typed input/checkpoint/write_memory tools are the later, separately validated milestone)",
-                      "locations" in props and "address" in props and not any(k in n for n in tools for k in ("watch", "command", "eval", "lua")), tools=sorted(tools))
+                check("MCP: capture_breakpoint advertises `locations` and still `address`; no command/eval/lua tool, and the only watchpoint tool is the typed capture_watchpoint (the typed input/checkpoint/write_memory/watchpoint/disassembly tools are separately validated milestones)",
+                      "locations" in props and "address" in props and not any(k in n for n in tools for k in ("command", "eval", "lua"))
+                      and {n for n in tools if "watch" in n} <= {"capture_watchpoint"}, tools=sorted(tools))
                 await s.call_tool("execution_control", {"action": "resume"})
                 await asyncio.sleep(4)
                 base = {"cpu": ":maincpu", "max_events": 20, "max_wall_seconds": 20, "registers": ["PC", "HL"], "memory": [{"address": 0, "size": 1}]}

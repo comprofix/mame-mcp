@@ -27,16 +27,16 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fx import Fixture, Results  # noqa: E402
+from _fx import ROMPATH, Fixture, Results, launch_mame  # noqa: E402
 
 from mame_mcp import winwake  # noqa: E402
 from mame_mcp.bridge import BridgeClient  # noqa: E402
-from mame_mcp.launcher import PROJECT_ROOT, launch  # noqa: E402
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 from mame_mcp.protocol import BridgeError  # noqa: E402
 
 OUT = PROJECT_ROOT / "runs" / "checkpoint_input"
-# ROM directory holding the machine without save-state support (section M); override with MAMEMCP_ALT_ROMPATH
-ALT_ROMPATH = Path(os.environ.get("MAMEMCP_ALT_ROMPATH", "D:/arcade/mame/roms"))
+# ROM directory holding the machine without save-state support (section M): the maintained ROM collection unless MAMEMCP_ALT_ROMPATH names another
+ALT_ROMPATH = Path(os.environ.get("MAMEMCP_ALT_ROMPATH", str(ROMPATH)))
 PROFILE = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "shinobi.json").read_text())
 P1944 = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "1944.json").read_text())
 CI = PROFILE["checkpoint_input"]
@@ -54,7 +54,7 @@ class Inst:
     def __init__(self, name: str, port: int, system: str = "shinobi", fixture: bool = True, test_env: dict | None = None, rompath: Path | None = None):
         self.name, self.run_dir = name, OUT / name
         shutil.rmtree(self.run_dir, ignore_errors=True)
-        self.proc, self.info = launch(system=system, port=port, run_dir=self.run_dir, fixture=fixture, test_env=test_env, **({"rompath": rompath} if rompath else {}))
+        self.proc, self.info = launch_mame(system=system, port=port, run_dir=self.run_dir, fixture=fixture, test_env=test_env, **({"rompath": rompath} if rompath else {}))
         wake = winwake.waker_for((self.proc.pid, self.info.get("pid_created_filetime")), port=port)
         self.fx = Fixture(self.info["fixture_dir"], wake=wake) if fixture else None
         self.c = BridgeClient(port=port, default_timeout=30, wake=wake)

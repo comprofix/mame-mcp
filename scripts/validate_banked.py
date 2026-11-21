@@ -26,17 +26,16 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fx import Fixture, Results  # noqa: E402
+from _fx import ROMPATH, Fixture, Results, launch_mame  # noqa: E402
 from validate_hardening import Ctx, wait_for  # noqa: E402  (shared helpers; its main() is not run)
 
 from mame_mcp import winwake  # noqa: E402
 from mame_mcp.bridge import BridgeClient  # noqa: E402
-from mame_mcp.launcher import PROJECT_ROOT, launch  # noqa: E402
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 from mame_mcp.protocol import BridgeError, capture_args, read_memory_args  # noqa: E402
 
 OUT = PROJECT_ROOT / "runs" / "banked"
 PORT, PORT_B = 9451, 9452
-ROMS = Path(r"D:\arcade\mame\roms")  # read only; the ROM collection is never modified
 PROFILE = json.loads((PROJECT_ROOT / "tests" / "fixtures" / "profiles" / "1942.json").read_text())
 MAIN, AUD = PROFILE["maincpu"], PROFILE["audiocpu"]
 H = lambda s: int(s, 16)  # noqa: E731
@@ -54,7 +53,7 @@ def region_image() -> tuple[bytes, dict]:
     br = PROFILE["backing_region"]
     img = bytearray(b"\xff" * 0x20000)
     hashes = {}
-    with zipfile.ZipFile(ROMS / PROFILE["rom_zip"]["file"]) as z:
+    with zipfile.ZipFile(ROMPATH / PROFILE["rom_zip"]["file"]) as z:
         for f in br["rom_files_in_region"]:
             data = z.read(f["name"])
             hashes[f["name"]] = hashlib.sha1(data).hexdigest() == f["sha1"] and len(data) == H(f["size"])
@@ -414,7 +413,7 @@ def section_nudge(b: Bank, proc, created, relaunch):
           claim="a demonstrated mitigation in this run, not a guarantee of timing; see validate_latency.py for the un-nudged comparison")
     x.clean_slate()
     # decoy: a second MAME on another port, and a recording shim around the posting primitive
-    procB, infoB = launch(system="1942", port=PORT_B, run_dir=OUT / "run_b", rompath=ROMS, fixture=False)
+    procB, infoB = launch_mame(system="1942", port=PORT_B, run_dir=OUT / "run_b", fixture=False)
     posted: list[int] = []
     real_wake = winwake.wake
     winwake.wake = lambda pid: (posted.append(pid), real_wake(pid))[1]
@@ -477,7 +476,7 @@ def main() -> int:
     run_dir = OUT / "run"
 
     def start():
-        p, i = launch(system="1942", port=PORT, run_dir=run_dir, rompath=ROMS, fixture=True)
+        p, i = launch_mame(system="1942", port=PORT, run_dir=run_dir, fixture=True)
         return p, i
     proc, info = start()
     created = winwake.creation_time(proc.pid)

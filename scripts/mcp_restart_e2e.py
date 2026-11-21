@@ -14,9 +14,7 @@ Writes runs/mcp_restart_e2e/results.json.  Usage: .venv\\Scripts\\python -I scri
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -25,13 +23,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fx import Fixture, Results  # noqa: E402
+from _fx import Fixture, Results, body_of, code_of, launch_mame  # noqa: E402
 
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
 
 from mame_mcp import winwake  # noqa: E402
-from mame_mcp.launcher import PROJECT_ROOT, launch  # noqa: E402
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 
 PORT = 9455 + 20
 OUT = PROJECT_ROOT / "runs" / "mcp_restart_e2e"
@@ -53,29 +51,13 @@ def suspend(pid: int) -> None:
     k32.CloseHandle(ctypes.c_void_p(h))
 
 
-def body_of(res) -> dict:
-    if res.is_error:
-        m = re.search(r"\{.*\}", res.content[0].text, re.S)
-        try:
-            return {"_error": json.loads(m.group(0))} if m else {"_error": {"code": "?", "message": res.content[0].text}}
-        except ValueError:
-            return {"_error": {"code": "?", "message": res.content[0].text}}
-    if res.structured_content is not None:
-        return res.structured_content
-    return json.loads(res.content[0].text)
-
-
-def code_of(b: dict) -> str | None:
-    return (b.get("_error") or {}).get("code")
-
-
 def new_mame():
     for stale in ("cmd.json", "reply.json"):
         try:
             (RUN / "fixture" / stale).unlink()
         except OSError:
             pass
-    proc, info = launch(port=PORT, run_dir=RUN, fixture=True)
+    proc, info = launch_mame(system="shinobi", port=PORT, run_dir=RUN, fixture=True)
     wake = winwake.waker_for(proc.pid)
     return proc, info, Fixture(info["fixture_dir"], wake=wake)
 

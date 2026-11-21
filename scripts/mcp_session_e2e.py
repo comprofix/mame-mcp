@@ -26,16 +26,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fx import Results, body_of, code_of  # noqa: E402
+from _fx import EXPECTED_TOOLS, MAME_DIR, ROMPATH, Results, body_of, code_of, launch_mame  # noqa: E402
 
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
 
 from mame_mcp import winwake  # noqa: E402
-from mame_mcp.launcher import PROJECT_ROOT, launch  # noqa: E402
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 
-MAME_DIR = r"D:\arcade\mame"
-ROMPATH = r"D:\arcade\mame\roms"
 OUT = PROJECT_ROOT / "runs" / "mcp_session_e2e"
 UNRELATED_PORT = 9481
 HANDLER = 0x404  # the validated Shinobi fixture address (68000 level-4 autovector handler), as in example_experiment.py
@@ -58,7 +56,7 @@ async def wait_dead(pid: int, timeout: float = 15.0) -> bool:
 
 
 def server_env(**extra) -> dict[str, str]:
-    env = {"SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "MAMEMCP_MAME_DIR": MAME_DIR, "MAMEMCP_ROMPATH": ROMPATH,
+    env = {"SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "MAMEMCP_MAME_DIR": str(MAME_DIR), "MAMEMCP_ROMPATH": str(ROMPATH),
            "MAMEMCP_RUNS_DIR": str(OUT / "sessions")}
     env.update(extra)
     return env
@@ -96,7 +94,7 @@ async def main() -> int:
         shutil.rmtree(OUT, ignore_errors=True)
     OUT.mkdir(parents=True)
     # An unrelated MAME: not launched by the MCP server, must never be attached to, stopped or modified.
-    uproc, uinfo = launch(port=UNRELATED_PORT, run_dir=OUT / "unrelated")
+    uproc, uinfo = launch_mame(system="shinobi", port=UNRELATED_PORT, run_dir=OUT / "unrelated")
     upid, ucreated = uproc.pid, uinfo["pid_created_filetime"]
     note("unrelated MAME started by the harness (not by the MCP server)", pid=upid, port=UNRELATED_PORT)
     try:
@@ -104,10 +102,7 @@ async def main() -> int:
         async with mcp_server(server_env(MAMEMCP_TEST_FAIL_CLEAR="1"), "server_stderr_main.txt") as s:
             # ---- A: no MAME ----------------------------------------------------------------------------
             tools = sorted(t.name for t in (await s.list_tools()).tools)
-            check("A server initialises with no MAME; tools listed", tools == sorted([
-                "start_session", "stop_session", "session_info", "read_memory", "read_registers", "capture_breakpoint",
-                "experiment_status", "cancel_experiment", "execution_control", "list_inputs", "press_inputs", "release_inputs",
-                "save_checkpoint", "load_checkpoint", "list_checkpoints", "write_memory"]), tools=tools)
+            check("A server initialises with no MAME; tools listed", tools == EXPECTED_TOOLS, tools=tools)
             by_name = {t.name: t for t in (await s.list_tools()).tools}
             check("A start_session takes only a system name and a bounded timeout (no paths, executables or MAME arguments)",
                   sorted(by_name["start_session"].input_schema["properties"]) == ["ready_timeout_s", "system"])

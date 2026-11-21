@@ -17,11 +17,11 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fx import Fixture, Results  # noqa: E402
+from _fx import Fixture, Results, launch_mame  # noqa: E402
 
 from mame_mcp import winwake  # noqa: E402
 from mame_mcp.bridge import BridgeClient  # noqa: E402
-from mame_mcp.launcher import PROJECT_ROOT, launch  # noqa: E402
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 from mame_mcp.protocol import BridgeError, capture_args, read_memory_args, read_registers_args  # noqa: E402
 
 OUT = PROJECT_ROOT / "runs" / "hardening"
@@ -497,7 +497,7 @@ def main() -> int:
     ap.add_argument("--sections", default="T,E,Z,R")
     a = ap.parse_args()
     want = set(a.sections.split(","))
-    proc, info = launch(port=PORT, run_dir=OUT / "run", fixture=True)
+    proc, info = launch_mame(system="shinobi", port=PORT, run_dir=OUT / "run", fixture=True)
     wake = winwake.waker_for(proc.pid)
     fx = Fixture(info["fixture_dir"], wake=wake)
     c = BridgeClient(port=PORT, default_timeout=30, wake=wake)

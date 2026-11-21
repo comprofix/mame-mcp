@@ -12,9 +12,12 @@ import sys
 import time
 from pathlib import Path
 
-from mame_mcp import winwake
-from mame_mcp.bridge import BridgeClient
-from mame_mcp.launcher import PROJECT_ROOT, launch
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _fx import launch_mame  # noqa: E402
+
+from mame_mcp import winwake  # noqa: E402
+from mame_mcp.bridge import BridgeClient  # noqa: E402
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 from mame_mcp.protocol import BridgeError, capture_args, read_memory_args, read_registers_args
 
 OUT = PROJECT_ROOT / "runs" / "validation"
@@ -59,7 +62,7 @@ def reg_map(res):
 
 def no_debugger_scenario() -> None:
     """MAME started without -debug: reads work, breakpoints are refused with a clear error."""
-    proc, _ = launch(port=PORT + 1, run_dir=OUT / "run-nodebug", debug=False)
+    proc, _ = launch_mame(system="shinobi", port=PORT + 1, run_dir=OUT / "run-nodebug", debug=False)
     c = BridgeClient(port=PORT + 1)
     try:
         si = c.connect(timeout=40)
@@ -89,7 +92,7 @@ def main() -> int:
         f'(temp0=1),curpc,d0,d1,a0,a1,sp,sr,b@{HANDLER:X},w@{HANDLER:X},d@sp}}\n'
         'g\n'
     )
-    proc, info = launch(port=PORT, run_dir=run_dir, debugscript=script, debuglog=True)
+    proc, info = launch_mame(system="shinobi", port=PORT, run_dir=run_dir, debugscript=script, debuglog=True)
     check("environment: romset verified by installed MAME", "is good" in info["verifyroms"]["output"],
           mame=info["mame_version"], verify=info["verifyroms"]["output"], zip_sha1=info["romset_zip"]["sha1"])
     c = BridgeClient(port=PORT, wake=winwake.waker_for(proc.pid))

@@ -19,14 +19,14 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fx import Fixture  # noqa: E402
-from validate_banked import FRAME, FRAME_NEXT, MAIN, PROFILE, ROMS, SEL, WIN0, expected, le, provenance  # noqa: E402
+from _fx import Fixture, launch_mame  # noqa: E402
+from validate_banked import FRAME, FRAME_NEXT, MAIN, PROFILE, SEL, WIN0, expected, le, provenance  # noqa: E402
 
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
 
 from mame_mcp import winwake  # noqa: E402
-from mame_mcp.launcher import PROJECT_ROOT, launch  # noqa: E402
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
 
 PORT = 9453
 OUT = PROJECT_ROOT / "runs" / "mcp_bank_e2e"
@@ -52,7 +52,7 @@ def entry_of(bank_context: dict) -> int | None:
 
 
 async def main() -> int:
-    proc, info = launch(system="1942", port=PORT, run_dir=OUT / "run", rompath=ROMS, fixture=True)
+    proc, info = launch_mame(system="1942", port=PORT, run_dir=OUT / "run", fixture=True)
     created = winwake.creation_time(proc.pid)
     fx = Fixture(info["fixture_dir"], wake=winwake.waker_for(lambda: (proc.pid, created), port=PORT))
     params = StdioServerParameters(

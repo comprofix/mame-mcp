@@ -596,3 +596,12 @@ def test_launcher_sets_the_state_dir_and_does_not_inherit_ambient_hooks(tmp_path
     assert "MAMEMCP_TEST_FORCE_SCHEDULED_CHECKPOINT" not in env and "MAMEMCP_TEST_FAIL_CLEAR" not in env
     sd = seen["cmd"][seen["cmd"].index("-state_directory") + 1]
     assert sd == env["MAMEMCP_STATE_DIR"]  # plugin and MAME agree on where the .sta files go
+
+
+def test_launcher_has_no_default_machine(capsys):
+    """The launcher is machine-agnostic: the caller always names the machine, in code and on the command line."""
+    with pytest.raises(TypeError):
+        launcher.launch(port=9999)  # no `system`: nothing is launched
+    with pytest.raises(SystemExit) as e:
+        launcher.main(["--port", "9999"])
+    assert e.value.code == 2 and "--system" in capsys.readouterr().err

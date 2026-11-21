@@ -10,12 +10,17 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import time
+from pathlib import Path
 
-from mame_mcp import winwake
-from mame_mcp.bridge import BridgeClient
-from mame_mcp.launcher import PROJECT_ROOT, launch
-from mame_mcp.protocol import BridgeError, read_registers_args
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _fx import launch_mame  # noqa: E402
+
+from mame_mcp import winwake  # noqa: E402
+from mame_mcp.bridge import BridgeClient  # noqa: E402
+from mame_mcp.launcher import PROJECT_ROOT  # noqa: E402
+from mame_mcp.protocol import BridgeError, read_registers_args  # noqa: E402
 
 OUT = PROJECT_ROOT / "runs" / "latency"
 OUT.mkdir(parents=True, exist_ok=True)
@@ -41,7 +46,7 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=2)
     a = ap.parse_args()
     gaps = [float(x) for x in a.gaps.split(",")]
-    proc, info = launch(port=PORT, run_dir=OUT / "run")
+    proc, info = launch_mame(system="shinobi", port=PORT, run_dir=OUT / "run")
     c = BridgeClient(port=PORT, default_timeout=60)
     samples: dict[str, list] = {}
     wake_samples: dict[str, list] = {}

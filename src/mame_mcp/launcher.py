@@ -84,7 +84,7 @@ def build_command(*, mame_exe: Path, system: str, rompath: Path, run_dir: Path, 
     return cmd
 
 
-def launch(*, system: str = "shinobi", port: int = 9411, run_dir: Path | None = None,
+def launch(*, system: str, port: int = 9411, run_dir: Path | None = None,
            mame_dir: Path = DEFAULT_MAME_DIR, rompath: Path | None = None, debug: bool = True,
            debugscript: Path | None = None, debuglog: bool = False, throttle: bool = True,
            extra: list[str] | None = None, write_launch_info: bool = True, fixture: bool = False,
@@ -151,7 +151,7 @@ def launch(*, system: str = "shinobi", port: int = 9411, run_dir: Path | None = 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Launch an isolated MAME instance with the mamemcp plugin")
-    ap.add_argument("--system", default="shinobi")
+    ap.add_argument("--system", required=True, help="MAME short name of the machine to launch (no default machine)")
     ap.add_argument("--port", type=int, default=9411)
     ap.add_argument("--run-dir", type=Path)
     ap.add_argument("--mame-dir", type=Path, default=DEFAULT_MAME_DIR)
