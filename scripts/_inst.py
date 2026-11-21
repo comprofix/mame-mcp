@@ -98,6 +98,23 @@ class Inst:
         self.rq("execution_control", {"action": "pause"})
         assert self.wait(lambda: self.state() == "paused", 30), "could not reach paused"
 
+    # checkpoints (same bridge operations and settling as validate_checkpoint_input.py) ------------------------------------
+    def settle(self, r: dict) -> dict:
+        end = time.time() + 40
+        while r.get("state") == "pending" and time.time() < end:
+            time.sleep(0.1)
+            r = self.c.request("checkpoint_status", {}, retry_safe=True)
+        if r.get("state") == "failed":
+            e = r["error"]
+            raise BridgeError(e["code"], e["message"], detail=e.get("detail"))
+        return r
+
+    def save(self, cid: str) -> dict:
+        return self.settle(self.c.request("checkpoint_save", {"id": cid}, mutating=True, timeout=30))
+
+    def load(self, cid: str, fp: dict) -> dict:
+        return self.settle(self.c.request("checkpoint_load", {"id": cid, "expect": fp}, mutating=True, timeout=30))
+
     def poll_done(self, exp_id: str | None = None, timeout: float = 60.0) -> dict:
         end = time.time() + timeout
         st: dict = {}

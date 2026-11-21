@@ -43,6 +43,7 @@ SUITES: dict[str, tuple[list[str], int, str]] = {
     "watchpoint": (["scripts/validate_watchpoint.py"], 110, "capture_watchpoint vs independent observers"),
     "disasm": (["scripts/validate_disasm.py"], 60, "disassemble_memory vs MAME's own dasm"),
     "sequence": (["scripts/validate_sequence.py"], 25, "press_sequence vs a per-frame port observer"),
+    "checkpoint_replay": (["scripts/validate_checkpoint_replay.py"], 30, "the same 35-frame input replayed after restoring a checkpoint: observer, vector-read tap, RAM hashes and registers, A vs B"),
     "wds": (["scripts/mcp_wds_e2e.py"], 15, "the three new tools through the MCP client"),
     "bank_capture": (["scripts/mcp_bank_capture_e2e.py"], 35, "examples/bank_capture.py on three different machines"),
     "checkpoint_e2e": (["scripts/mcp_checkpoint_e2e.py"], 25, "checkpoints, RAM writes and inputs through the MCP client"),
@@ -57,7 +58,7 @@ SUITES: dict[str, tuple[list[str], int, str]] = {
     "latency": (["scripts/validate_latency.py"], 910, "debugger-stopped first-request latency and late-reply retries"),
 }
 LIFECYCLE = ["unit", "stop_reconnect", "session", "restart", "screenshot", "e2e", "multisession"]
-TOOLS = ["watchpoint", "disasm", "sequence", "wds", "bank_capture", "checkpoint_e2e", "bank_e2e", "multi_e2e"]
+TOOLS = ["watchpoint", "disasm", "sequence", "checkpoint_replay", "wds", "bank_capture", "checkpoint_e2e", "bank_e2e", "multi_e2e"]
 LEGACY = ["validate", "banked", "checkpoint_input", "hardening", "multi"]
 SETS: dict[str, list[str]] = {"unit": ["unit"], "lifecycle": LIFECYCLE, "tools": TOOLS, "legacy": LEGACY, "latency": ["latency"], "all": LIFECYCLE + TOOLS + LEGACY}
 NATURAL = {"screenshot", "restart"}  # suites whose original symptom was intermittent; repeats only mean something for these
