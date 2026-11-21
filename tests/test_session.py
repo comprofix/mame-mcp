@@ -86,6 +86,8 @@ class FakeClient:
             return {"state": "cancelled", "completion_reason": "cancelled", "cleanup": {"verified": self.cancel_verified}}
         if op == "input_cancel":  # teardown always releases held inputs first; nothing is held in these tests
             return {"state": "none", "was_holding": False, "release_errors": []}
+        if op == "shutdown":  # the clean-exit request: accepted, but the fake process stays alive unless a test ends it
+            return {"accepted": True}
         raise AssertionError(op)
 
     def close(self, graceful=True):
@@ -150,6 +152,7 @@ class Rig:
 @pytest.fixture(autouse=True)
 def _fast(monkeypatch):
     monkeypatch.setattr(session, "MIN_READY_TIMEOUT", 0.05)
+    monkeypatch.setattr(session, "EXIT_WAIT", 0.05)  # a fake process never exits on the clean-exit request unless a test makes it
 
 
 @pytest.fixture

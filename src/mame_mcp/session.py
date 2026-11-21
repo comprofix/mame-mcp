@@ -52,6 +52,12 @@ DEFAULT_READY_TIMEOUT = 60.0
 STARTUP_POLL_S = 0.5  # while MAME answers but has not finished loading (no devices listed yet)
 MIN_READY_TIMEOUT, MAX_READY_TIMEOUT = 5.0, 120.0
 TERMINATE_WAIT, KILL_WAIT = 5.0, 3.0
+# Clean exit: the fixed `shutdown` bridge operation (plugin calls machine:exit() once its reply is flushed). MAME's own SIGTERM
+# handling does not stop it on Linux (measured: a caught, consumed signal and no exit in running, paused and debugger-stopped
+# states), so this is the primary stop; terminate and kill remain as identity-checked fallbacks. Measured clean exits took
+# 0.06-0.36 s; the bounds below leave margin yet stay inside a short client shutdown window.
+EXIT_REQUEST_TIMEOUT = 2.0   # bound on the bridge reply to the exit request
+EXIT_WAIT = 3.0              # bound on the process exit after the request was made (reply accepted, lost or timed out)
 DRAIN_WAIT = 20.0
 DEFAULT_MAX_SESSIONS, MAX_SESSIONS_CEILING = 3, 16
 PORT_PICK_ATTEMPTS = 20      # bound on picking a bridge port not reserved by another session
@@ -703,15 +709,53 @@ class SessionManager(StateOperations):
         verdict = None
         if s.proc is not None and s.proc.poll() is None:
             verdict = self._verify_owned(s, check_port=(prior == READY))
+        # Clean-exit request, made while the bridge is still connected and only for a process whose ownership was just proven.
+        # Inputs and captures were finalised above. It is never retried; an error or an unknown outcome falls through to the
+        # identity-checked terminate/kill below.
+        exit_request = None
+        if (prior == READY and verdict is not None and verdict[0] and s.client is not None and s.proc is not None
+                and s.proc.poll() is None and getattr(s.client, "connected", True)):
+            exit_request = self._request_exit(s)
         if s.client is not None:
             s.client.close(graceful=False)
         if s.proc is not None:
-            report["process"] = self._terminate(s, check_port=(prior == READY), preverified=verdict)
+            report["process"] = self._terminate(s, check_port=(prior == READY), preverified=verdict, exit_request=exit_request)
             if report["process"].get("refused"):
                 failures.append("process was NOT stopped: " + report["process"]["refused"])
             elif report["process"].get("still_running"):
                 failures.append("process did not exit after kill")
         return report
+
+    @staticmethod
+    def _request_exit(s: Session) -> dict[str, Any]:
+        """Ask the owned MAME to exit through the fixed `shutdown` bridge operation, then wait (bounded) for the process to go.
+        The state-changing request is sent exactly once (never retried). Outcomes:
+          accepted         the plugin replied before exiting (the normal case);
+          connection_lost  the connection broke before a reply was read: the request may or may not have been accepted;
+          timeout          no reply in time: unknown outcome;
+          error            the plugin refused or failed the request: nothing is waiting to happen, fall back at once.
+        Never raises. Never touches an external attachment (only a Session this server launched reaches here)."""
+        out: dict[str, Any] = {"requested": True, "reply": None}
+        t0 = time.monotonic()
+        try:
+            s.client.request("shutdown", {}, timeout=EXIT_REQUEST_TIMEOUT, mutating=True)
+            out["reply"] = "accepted"
+        except BridgeError as e:
+            out["reply"] = {"mame_disconnected": "connection_lost", "request_timeout": "timeout"}.get(e.code, "error")
+            out["error"] = e.to_dict()
+        except Exception as e:  # noqa: BLE001 - the clean exit is best effort; the fallback below still stops the process
+            out["reply"] = "error"
+            out["error"] = {"code": "internal_error", "message": f"{type(e).__name__}: {e}"}
+        if out["reply"] != "error":
+            try:
+                s.proc.wait(max(0.0, EXIT_WAIT))
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception as e:  # noqa: BLE001
+                out["wait_error"] = f"{type(e).__name__}: {e}"
+        out["exited"] = s.proc.poll() is not None
+        out["elapsed_s"] = round(time.monotonic() - t0, 3)
+        return out
 
     @staticmethod
     def _cancel_active_capture(client: BridgeClient, timeout: float) -> dict[str, Any]:
@@ -765,16 +809,23 @@ class SessionManager(StateOperations):
         return True, ("image and creation time verified; no process currently holds the bridge port (the connection was reset "
                       "and the plugin has not re-listened yet), and no other process owns it")
 
-    def _terminate(self, s: Session, *, check_port: bool, preverified: tuple[bool, str] | None = None) -> dict[str, Any]:
+    def _terminate(self, s: Session, *, check_port: bool, preverified: tuple[bool, str] | None = None,
+                   exit_request: dict[str, Any] | None = None) -> dict[str, Any]:
         """Stop the owned process after verifying it is the one this session launched.
 
         `preverified` is the verdict of `_verify_owned` taken EARLIER, while the bridge connection was still open (the only time
         bridge-port ownership can be observed reliably); it is then re-checked here for what is still observable (image and
-        creation time) so an identity change in between is caught. Termination goes through the Popen handle, which on Windows
-        keeps the pid from being reused while it is open. A process that exits at any point before the terminate call is
-        reported as exited (exited_before_termination), not as a refusal and not as something this server terminated."""
+        creation time) so an identity change in between is caught. `exit_request` is the outcome of the clean-exit request made
+        before the bridge was closed (see _request_exit); when the process is gone by now it is what stopped it.
+        Termination goes through the Popen handle, which on Windows keeps the pid from being reused while it is open. Identity
+        is re-checked before EACH fallback action (terminate, then kill), never assumed from an earlier check.
+        A process that exits at any point before an action is taken is reported as exited, not as a refusal and not as something
+        this server terminated. `exit_method` says what actually stopped it: clean_exit_request | terminate | kill |
+        exited_before_stop (gone before this stop acted) | exited_without_our_action (went away while being verified)."""
         proc = s.proc
-        out: dict[str, Any] = {"pid": s.pid, "was_running": False, "terminated": False, "exit_code": None}
+        out: dict[str, Any] = {"pid": s.pid, "was_running": False, "terminated": False, "exit_code": None, "exit_method": None}
+        if exit_request is not None:
+            out["exit_request"] = exit_request
 
         def _exited() -> bool:
             rc_now = proc.poll()
@@ -784,41 +835,73 @@ class SessionManager(StateOperations):
             return True
 
         if _exited():
-            if preverified is not None:  # it was alive when its identity was checked and has exited since: nothing was terminated by us
+            if exit_request is not None and exit_request.get("reply") != "error":  # alive when the exit was requested, gone now
                 out["was_running"], out["exited_before_termination"] = True, True
+                out["exit_method"] = "clean_exit_request"
+                out["terminated"] = True  # the process is gone; nothing remains to stop (kept for the established report shape)
+                out["identity_check"] = (preverified or (True, ""))[1]
+            elif preverified is not None:  # alive when its identity was checked, gone since (a refused request did not stop it)
+                out["was_running"], out["exited_before_termination"] = True, True
+                out["exit_method"] = "exited_without_our_action"
+            else:
+                out["exit_method"] = "exited_before_stop"
             return out
         out["was_running"] = True
         if preverified is None:
             ok, why = self._verify_owned(s, check_port=check_port)
+            fresh = True  # verified just now
         else:
             ok, why = preverified
-            if ok:
-                ok2, why2 = self._verify_owned(s, check_port=False)
-                if not ok2:
-                    ok, why = False, f"identity changed between verification and termination: {why2} (verified earlier: {why})"
+            fresh = False
+        if ok and not fresh:
+            ok, why = self._recheck_identity(s, why, "terminate")
         if not ok:
-            if _exited():  # it went away while it was being verified (an unreadable image is then expected)
-                out["exited_before_termination"] = True
-                out["identity_check"] = f"not checked to completion: the process exited meanwhile ({why})"
-                return out
-            out["identity_check"] = why
-            out["refused"] = why  # an unverified process is never terminated
-            return out
+            return self._refuse_or_exited(out, why, _exited)
         out["identity_check"] = why
         try:
             proc.terminate()
+            out["escalated_to_terminate"] = True
             try:
                 proc.wait(TERMINATE_WAIT)
+                out["exit_method"] = "terminate"
             except Exception:
-                out["escalated_to_kill"] = True
-                proc.kill()
-                proc.wait(KILL_WAIT)
+                if _exited():  # it went away right at the end of the wait
+                    out["exit_method"] = "terminate"
+                else:
+                    ok2, why2 = self._recheck_identity(s, why, "kill")
+                    if not ok2:
+                        return self._refuse_or_exited(out, why2, _exited)
+                    out["escalated_to_kill"] = True
+                    proc.kill()
+                    proc.wait(KILL_WAIT)
+                    out["exit_method"] = "kill"
         except Exception as e:
             out["error"] = f"{type(e).__name__}: {e}"
         rc = proc.poll()
         out["terminated"] = rc is not None
         out["still_running"] = rc is None
         out["exit_code"] = s.exit_code = rc
+        if rc is None:
+            out["exit_method"] = None
+        return out
+
+    def _recheck_identity(self, s: Session, earlier: str, action: str) -> tuple[bool, str]:
+        """Image and creation-time check immediately before a fallback action (the bridge port can no longer be observed)."""
+        ok, why = self._verify_owned(s, check_port=False)
+        if ok:
+            return True, earlier
+        what = "between verification and termination" if action == "terminate" else f"before {action}"
+        return False, f"identity changed {what}: {why} (verified earlier: {earlier})"
+
+    @staticmethod
+    def _refuse_or_exited(out: dict[str, Any], why: str, exited) -> dict[str, Any]:
+        if exited():  # it went away while it was being verified (an unreadable image is then expected)
+            out["exited_before_termination"] = True
+            out["exit_method"] = "exited_without_our_action"
+            out["identity_check"] = f"not checked to completion: the process exited meanwhile ({why})"
+            return out
+        out["identity_check"] = why
+        out["refused"] = why  # an unverified process is never terminated or killed
         return out
 
     # ------------------------------------------------------------------ server shutdown

@@ -104,6 +104,7 @@ function exports.startplugin()
 	local write_failures = 0
 	local last_heartbeat_ms = 0
 	local reopen_after_flush = false
+	local exit_after_flush = false  -- set by the `shutdown` operation: ask MAME to exit once its reply has been flushed
 	local reconnects = 0
 	-- Forward declarations: held inputs are released whenever the client goes away (defined with the input operations).
 	local epoch = 0            -- bumped by every verified checkpoint load; older experiment ids are stale afterwards
@@ -118,6 +119,7 @@ function exports.startplugin()
 		pcall(function() sock:close() end)
 		inbuf, outbuf = "", ""
 		client_seen, write_failures, reopen_after_flush = false, 0, false
+		-- exit_after_flush is deliberately NOT cleared here: an accepted exit request stands even if the connection dies
 		reconnects = reconnects + 1
 		local err = open_socket()
 		print("mamemcp: socket reopened (" .. reason .. ")" .. (err and (" ERROR " .. tostring(err)) or ""))
@@ -412,7 +414,7 @@ function exports.startplugin()
 					"experiment_status", "cancel_experiment", "execution_control", "goodbye",
 					"list_inputs", "input_press", "input_status", "input_cancel", "write_memory",
 					"checkpoint_save", "checkpoint_load", "checkpoint_status", "screen_list", "screenshot",
-					"capture_watchpoint", "disassemble", "input_sequence" },
+					"capture_watchpoint", "disassemble", "input_sequence", "shutdown" },
 				capture_scope = "breakpoints on the program space of the named cpu, or watchpoints on one explicit address space/range of it (capture_watchpoint); registers are read in the breakpoint/watchpoint condition (that cpu's own symbol table); memory fields use explicitly device-qualified, side-effect-suppressed debugger operators (tag.pb@ etc.). Breakpoints verified on :maincpu (68000) and :soundcpu (Z80) of shinobi; watchpoints verified against Lua memory taps on 68000 and Z80 spaces.",
 			},
 			active_experiment = active and active.id or nil,
@@ -567,6 +569,15 @@ function exports.startplugin()
 	function ops.goodbye(args)
 		reopen_after_flush = true
 		return { closing = true, note = "bridge will accept a new client after this reply is flushed" }
+	end
+
+	-- Fixed, internal application-exit request used only by the managed-session teardown (no public MCP tool, no arguments, no
+	-- Lua from the client). MAME's own SIGTERM handling does not stop a -video none MAME on Linux, so this is the clean-exit path.
+	-- The reply is queued first and machine:exit() is called only after it has been flushed (see service_socket), so the server
+	-- can tell an accepted request from an error before the connection goes away.
+	function ops.shutdown(args)
+		exit_after_flush = true
+		return { accepted = true, action = "machine_exit", note = "MAME will call machine:exit() once this reply has been flushed" }
 	end
 
 	function ops.execution_control(args)
@@ -2957,6 +2968,13 @@ function exports.startplugin()
 				write_failures = 0
 			end
 			outbuf = outbuf:sub(n + 1)
+		end
+		if exit_after_flush and #outbuf == 0 then
+			exit_after_flush = false
+			print("mamemcp: shutdown requested by the managed-session teardown; exiting MAME")
+			local okx, ex = pcall(function() manager.machine:exit() end)
+			if not okx then print("mamemcp: machine:exit() failed: " .. tostring(ex)) end
+			return
 		end
 		if reopen_after_flush and #outbuf == 0 then
 			reopen_socket("client said goodbye")

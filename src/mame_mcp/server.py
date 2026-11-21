@@ -678,7 +678,7 @@ def main() -> None:
             for run_id, r in rep["sessions"].items():
                 cap, proc = r.get("capture_cleanup") or {}, r.get("process") or {}
                 _log(f"shutdown cleanup: session={run_id} capture_verified={cap.get('verified')} process_terminated={proc.get('terminated')} "
-                     f"exit_code={proc.get('exit_code')} failures={r.get('cleanup_failures')}")
+                     f"exit_method={proc.get('exit_method')} exit_code={proc.get('exit_code')} failures={r.get('cleanup_failures')}")
 
 
 if __name__ == "__main__":
