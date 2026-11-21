@@ -6,10 +6,11 @@ launches an isolated MAME of its own with a Lua plugin and the debugger enabled,
 socket and exposes a fixed set of tools. Results are structured and size-limited; detailed capture events are written to
 JSONL evidence files in a per-session run directory instead of being returned into the conversation.
 
-Tools (21):
+Tools (22):
 
-* **Session:** `start_session` launches an isolated MAME for a system, stopped in the debugger; `stop_session` stops only the
-  MAME this server started, after verifying its identity; `session_info` reports session state, machine, CPUs and execution state.
+* **Session:** `start_session` launches an isolated MAME for a system, stopped in the debugger, and returns its `session_id`;
+  `list_sessions` shows every session; `stop_session` stops only the MAME this server started for the named session, after
+  verifying its identity; `session_info` reports one session's state, machine, CPUs and execution state.
 * **Inspection:** `read_memory`, `read_registers`, `disassemble_memory` (decoded by MAME's own disassembler).
 * **Bounded captures:** `capture_breakpoint` and `capture_watchpoint` start asynchronous, limit-bounded experiments;
   `experiment_status` and `cancel_experiment` follow and stop them.
@@ -20,8 +21,10 @@ Tools (21):
 * **Screens:** `list_screens` and `capture_screenshot` return the emulated game screen as a PNG.
 
 There is deliberately no tool for arbitrary Lua, shell or debugger commands. The MAME executable, ROM paths and MAME arguments
-come from the server's configuration and cannot be set through tool arguments. One managed session exists at a time. The MAME
-installation is not modified: the plugin is loaded from this repository, and all writable state goes to a run directory.
+come from the server's configuration and cannot be set through tool arguments. One server can run several managed sessions at
+once (default limit 3), including several of the same system; each has its own MAME process, bridge connection, run directory,
+captures, inputs and checkpoints. The MAME installation is not modified: the plugin is loaded from this repository, and all
+writable state goes to a run directory.
 
 Status: proof of concept, developed against MAME 0.289 on Windows and also run on native Linux (Debian with Debian's MAME 0.289
 package).
@@ -81,6 +84,7 @@ The server reads its machine-local settings from its environment; none of them c
 | `MAMEMCP_MAME_PLUGINS` | MAME's own plugin folder. Default: `plugins` next to the executable if it holds `boot.lua`, otherwise the `pluginspath` from MAME's configuration (`mame -showconfig`). |
 | `MAMEMCP_ROMPATH` | ROM directories separated by `;` (on every platform). The first one holding `<system>.zip`, `<system>.7z` or a `<system>` folder is used (a clone's parent set must be in the same directory). Default: `roms` next to the executable if that folder exists, otherwise the `rompath` from MAME's configuration. |
 | `MAMEMCP_RUNS_DIR` | Parent of the per-session run directories. Default: `runs/sessions` inside this repository (git-ignored). |
+| `MAMEMCP_MAX_SESSIONS` | Most sessions live at once (starting, ready or stopping), 1 to 16. Default 3. A start beyond the limit is refused before any MAME is launched; an invalid value makes `start_session` refuse until it is fixed. |
 
 Register the server once with Claude Code (user scope). Windows:
 
@@ -130,14 +134,18 @@ Ask the agent in plain language, for example:
 
 The tool sequence behind that request:
 
-1. `start_session` with `system` set to a MAME short name. MAME starts **stopped in the debugger**.
+1. `start_session` with `system` set to a MAME short name. MAME starts **stopped in the debugger**. The reply carries the
+   `session_id`. Pass it as `session_id` to every other tool; omitting it works only while exactly one session is live and is
+   refused as ambiguous otherwise (`list_sessions` shows them). An unknown or ended id is refused, never redirected to another
+   session. A checkpoint id never chooses the session it is loaded into: name the target `session_id`.
 2. `execution_control` with `resume` to run it. Disassembly, checkpoints and RAM writes require stopped execution (paused or debugger-stopped).
 3. `capture_breakpoint` or `capture_watchpoint` returns an experiment id immediately. Poll `experiment_status` until it completes;
    the events are written to `events.jsonl` under `<runs>/<system>-<date>-<time>-<id>/evidence/<experiment id>/`.
 4. `session_info` works at any time. Its `execution.state` (`running`, `paused` or `debugger_stopped`) is the authoritative
    execution classification; after `execution_control`, confirm the result with a fresh `session_info`, because the reply only
    acknowledges the request.
-5. `stop_session` when done: it cancels any active capture, releases held inputs and stops only the MAME this server launched.
+5. `stop_session` when done: it cancels any active capture, releases held inputs and stops only the MAME this server launched
+   for that session; other sessions keep running. When the server shuts down it stops every session it owns.
 
 # Tests
 
@@ -155,7 +163,7 @@ either is missing.
 **Real-MAME checks** (`scripts\`, configured for Windows) start real MAME 0.289 through the production server using the official MCP client SDK. They
 verify the session lifecycle, stop and reconnect behaviour, breakpoint, watchpoint and banked-memory captures, disassembly
 against MAME's own disassembler, input sequences against an independent per-frame observer, checkpoints and RAM writes, and
-screenshots. Together they need the ROM sets for `shinobi`, `1942`, `1944`, `1943kai` and `005`. The MAME and ROM locations are the
+screenshots, and three simultaneous sessions through one server (routing, isolation, session limit, shutdown). Together they need the ROM sets for `shinobi`, `1942`, `1944`, `1943kai` and `005`. The MAME and ROM locations are the
 `MAME_DIR` and `ROMPATH` constants at the top of `scripts\_fx.py` (they are deliberately not read from the environment): edit
 them to match your installation. The checks run one at a time, need no other `mame.exe` running, and start and stop only their
 own MAME.
@@ -169,7 +177,7 @@ From the repository root:
 .\.venv\Scripts\python -I scripts\run_checks.py lifecycle             # run a real-MAME set once
 ```
 
-`run_checks.py` takes one or more sets: `unit`, `lifecycle` (session, stop and reconnect, restart, screenshots), `tools` (the
+`run_checks.py` takes one or more sets: `unit`, `lifecycle` (session, multi-session, stop and reconnect, restart, screenshots), `tools` (the
 capture, disassembly, input, checkpoint and example-client checks), `legacy` (the older direct-bridge suites) and `all`
 (`lifecycle` + `tools` + `legacy`). `latency` (about 15 minutes) is opt-in. A single suite can be named instead of a set; run
 `--plan <set>` lists the suites in that set.
