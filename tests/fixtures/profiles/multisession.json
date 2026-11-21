@@ -1,0 +1,29 @@
+{
+  "_comment": "Machine-specific facts for the multi-session validation (scripts/mcp_multisession_e2e.py, MAME 0.289). The server contains none of these. Shinobi addresses and inputs come from the same declared maps recorded in shinobi.json (checkpoint_input) and 1942 from 1942.json; nothing here claims a RAM byte is unused by the game beyond what those profiles already verified.",
+  "sessions": [
+    {"name": "a", "system": "shinobi"},
+    {"name": "b", "system": "shinobi"},
+    {"name": "c", "system": "1942"}
+  ],
+  "extra_start": {"system": "shinobi", "note": "started after one session was stopped and a start failed, to show the slot is reusable"},
+  "corrupt_rom_system": {"system": "pacman", "note": "a system the real ROM collection does not hold; the harness places a corrupt pacman.zip in an extra ROM directory so MAME itself fails the start"},
+  "shinobi": {
+    "cpu": ":maincpu",
+    "space": "program",
+    "capture": {"address": "0x404", "registers": ["D0", "SR"], "note": "68000 level-4 autovector handler, hit about every frame (shinobi.json maincpu.handler_pc)"},
+    "ram": {"address": "0xC70010", "width": 1, "marker_a": "0xA1", "marker_b": "0xB7", "changed": "0x77", "note": "plain RAM in the declared map (shinobi.json checkpoint_input.ram)"},
+    "rom_read": {"address": "0x0", "length": 8, "note": "68000 vector table: initial SP and PC"},
+    "input": {
+      "press": {"port": ":P1", "field": "P1 Button 1"},
+      "sequence": [{"port": ":P1", "field": "P1 Left", "start": 0, "frames": 30}, {"port": ":P1", "field": "P1 Button 2", "start": 10, "frames": 30}]
+    }
+  },
+  "1942": {
+    "cpu": ":maincpu",
+    "space": "program",
+    "capture": {"address": "0x11", "registers": ["PC", "HL"], "note": "per-frame RST 10h handler, about 60 per second (1942.json maincpu.frame_handler_pc)"},
+    "rom_read": {"address": "0x0", "length": 8, "note": "Z80 reset code"}
+  },
+  "bounded_capture_events": 240,
+  "long_capture_events": 10000
+}

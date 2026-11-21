@@ -57,7 +57,7 @@ async def wait_dead(pid: int, timeout: float = 15.0) -> bool:
 
 def server_env(**extra) -> dict[str, str]:
     env = {"SYSTEMROOT": os.environ.get("SYSTEMROOT", ""), "MAMEMCP_MAME_DIR": str(MAME_DIR), "MAMEMCP_ROMPATH": str(ROMPATH),
-           "MAMEMCP_RUNS_DIR": str(OUT / "sessions")}
+           "MAMEMCP_RUNS_DIR": str(OUT / "sessions"), "MAMEMCP_MAX_SESSIONS": "1"}  # one session at a time: this suite is about ONE session's lifecycle (several: mcp_multisession_e2e.py)
     env.update(extra)
     return env
 
@@ -131,7 +131,7 @@ async def main() -> int:
             check("B MAME starts stopped in the debugger; romset verified good", r1["execution"]["state"] == "debugger_stopped"
                   and "is good" in (r1["romset"]["verifyroms"] or ""), romset=r1["romset"])
             r1b = await call(s, "start_session", system="shinobi")
-            check("B second start refused while a managed session is active (nothing launched)", code_of(r1b) == "session_active", error=r1b.get("_error"))
+            check("B second start refused while the session limit (1 here) is reached (nothing launched)", code_of(r1b) == "session_limit_reached", error=r1b.get("_error"))
             check("B the launched MAME is a different process from the unrelated one", pid1 != upid and alive(upid, ucreated) and alive(pid1))
 
             # ---- C: inspect, resume, bounded capture ----------------------------------------------------

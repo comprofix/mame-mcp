@@ -19,7 +19,8 @@ ROMPATH = Path(r"D:\arcade\mame\ROMS")   # the ROM collection (1942, 1944, 1943k
 EXPECTED_TOOLS = sorted([
     "start_session", "stop_session", "session_info", "read_memory", "read_registers", "capture_breakpoint", "experiment_status",
     "cancel_experiment", "execution_control", "list_inputs", "press_inputs", "release_inputs", "save_checkpoint", "load_checkpoint",
-    "list_checkpoints", "write_memory", "list_screens", "capture_screenshot", "capture_watchpoint", "disassemble_memory", "press_sequence"])
+    "list_checkpoints", "write_memory", "list_screens", "capture_screenshot", "capture_watchpoint", "disassemble_memory", "press_sequence",
+    "list_sessions"])
 
 
 def launch_mame(**kw):

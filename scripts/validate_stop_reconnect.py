@@ -88,7 +88,7 @@ def one_session(state: str, via: str) -> dict:
             if state == "paused":
                 client.execution_control("pause")
                 time.sleep(0.5)
-        rep = mgr.stop() if via == "stop_session" else mgr.shutdown()
+        rep = mgr.stop() if via == "stop_session" else next(iter(mgr.shutdown()["sessions"].values()))  # shutdown reports per session
     finally:
         if alive(pid):  # never leave a MAME behind, whatever the outcome
             import subprocess

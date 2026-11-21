@@ -48,6 +48,7 @@ SUITES: dict[str, tuple[list[str], int, str]] = {
     "checkpoint_e2e": (["scripts/mcp_checkpoint_e2e.py"], 25, "checkpoints, RAM writes and inputs through the MCP client"),
     "bank_e2e": (["scripts/mcp_bank_e2e.py"], 20, "banked capture through the MCP client"),
     "multi_e2e": (["scripts/mcp_multi_e2e.py"], 10, "multi-location capture through the MCP client; tool-list shape"),
+    "multisession": (["scripts/mcp_multisession_e2e.py"], 120, "three simultaneous managed sessions (two shinobi, one 1942) through one MCP server: routing, isolation, limit, shutdown"),
     "validate": (["scripts/validate.py"], 30, "direct-bridge regression (Shinobi)"),
     "banked": (["scripts/validate_banked.py"], 105, "banked-memory validation (1942)"),
     "checkpoint_input": (["scripts/validate_checkpoint_input.py"], 95, "plugin-level checkpoints, held inputs, RAM writes"),
@@ -55,7 +56,7 @@ SUITES: dict[str, tuple[list[str], int, str]] = {
     "multi": (["scripts/validate_multi.py"], 75, "multi-address capture validation (1942)"),
     "latency": (["scripts/validate_latency.py"], 910, "debugger-stopped first-request latency and late-reply retries"),
 }
-LIFECYCLE = ["unit", "stop_reconnect", "session", "restart", "screenshot", "e2e"]
+LIFECYCLE = ["unit", "stop_reconnect", "session", "restart", "screenshot", "e2e", "multisession"]
 TOOLS = ["watchpoint", "disasm", "sequence", "wds", "bank_capture", "checkpoint_e2e", "bank_e2e", "multi_e2e"]
 LEGACY = ["validate", "banked", "checkpoint_input", "hardening", "multi"]
 SETS: dict[str, list[str]] = {"unit": ["unit"], "lifecycle": LIFECYCLE, "tools": TOOLS, "legacy": LEGACY, "latency": ["latency"], "all": LIFECYCLE + TOOLS + LEGACY}
