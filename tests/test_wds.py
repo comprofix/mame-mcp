@@ -196,7 +196,7 @@ def test_press_inputs_is_unchanged_next_to_press_sequence(rig):
 # ------------------------------------------------------------------------------------------------ server surface
 EXPECTED = {"start_session", "stop_session", "session_info", "read_memory", "read_registers", "capture_breakpoint", "capture_watchpoint", "disassemble_memory",
             "experiment_status", "cancel_experiment", "execution_control", "list_inputs", "press_inputs", "press_sequence", "release_inputs", "save_checkpoint",
-            "load_checkpoint", "list_checkpoints", "write_memory", "list_screens", "capture_screenshot"}
+            "load_checkpoint", "list_checkpoints", "write_memory", "list_screens", "capture_screenshot", "list_sessions"}
 
 
 def tools():

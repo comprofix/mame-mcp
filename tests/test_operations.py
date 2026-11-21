@@ -537,7 +537,7 @@ def test_stop_session_reports_a_failed_input_release_but_still_stops(rig):
 
 def test_server_shutdown_releases_held_inputs(rig):
     rig.handlers["input_cancel"] = {"state": "cancelled", "was_holding": True, "end_reason": "cancelled", "release_errors": []}
-    rep = rig.mgr.shutdown()
+    rep = next(iter(rig.mgr.shutdown()["sessions"].values()))
     assert rep["input_cleanup"]["released"] is True and rig.count("input_cancel") == 1 and rig.procs[0].rc is not None
 
 

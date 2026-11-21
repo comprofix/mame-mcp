@@ -333,6 +333,20 @@ def check_label(label: Any) -> str | None:
     return label.strip()
 
 
+EXPERIMENT_ID = re.compile(r"^exp-(?P<sid>s\d+-[0-9a-f]{6})-\d{3,}$")  # exp-<bridge session id>-NNN, as the plugin names them
+
+
+def check_experiment_owner(experiment_id: Any, session_id: str | None) -> None:
+    """Refuse an experiment id that names a different bridge session than the one the call is routed to, before anything is
+    sent. The plugin makes the same refusal on its side (experiment_from_other_session); this is the cheap first line, and is
+    what stops an id from one session being used against another session of the same server."""
+    m = EXPERIMENT_ID.fullmatch(experiment_id) if isinstance(experiment_id, str) else None
+    if m is not None and session_id and m.group("sid") != session_id:
+        raise BridgeError("experiment_from_other_session",
+                          f"experiment {experiment_id} belongs to session {m.group('sid')}, not session {session_id}; "
+                          "pass the session_id the experiment was started on. Nothing was sent.")
+
+
 def check_checkpoint_id(cid: Any) -> re.Match[str]:
     m = CHECKPOINT_ID.fullmatch(cid) if isinstance(cid, str) else None  # fullmatch: '$' would accept a trailing newline
     if m is None:

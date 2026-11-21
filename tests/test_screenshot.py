@@ -105,9 +105,9 @@ def test_screenshot_args():
 
 def test_there_is_no_way_to_choose_an_output_path():
     import inspect
-    assert list(inspect.signature(server.capture_screenshot).parameters) == ["screen"]
-    assert list(inspect.signature(server.list_screens).parameters) == []
-    assert list(inspect.signature(operations.StateOperations.capture_screenshot).parameters) == ["self", "screen"]
+    assert list(inspect.signature(server.capture_screenshot).parameters) == ["screen", "session_id"]
+    assert list(inspect.signature(server.list_screens).parameters) == ["session_id"]
+    assert list(inspect.signature(operations.StateOperations.capture_screenshot).parameters) == ["self", "screen", "session_id"]
 
 
 # ------------------------------------------------------------------------------------------------ session operation

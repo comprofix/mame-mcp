@@ -4,16 +4,21 @@ Mixed into SessionManager (session.py). Everything here is for a session this se
 externally attached MAME, because ownership is what makes cleanup and session-owned file paths meaningful.
 
 Rules shared by all of it:
-  * One state-changing operation at a time (`exclusive`), so checkpoints, input presses/releases and RAM writes are
-    serialised against each other. start/stop are serialised by the existing in-flight accounting (`use_managed`): a
-    stop never interleaves with a bridge call, and every poll below re-checks that the session is still READY.
+  * Every operation takes an optional `session_id`. The target session is resolved ONCE at the start (omission selects the
+    sole live session and is refused as ambiguous otherwise) and the resolved Session object is used for every later step,
+    including polls: an operation can never drift to another session.
+  * One state-changing operation at a time PER SESSION (`exclusive`), so checkpoints, input presses/releases and RAM writes of
+    one session are serialised against each other while other sessions proceed. start/stop are serialised by the per-session
+    in-flight accounting (`use_managed`): a stop never interleaves with a bridge call of that session, and every poll below
+    re-checks that the session is still READY.
   * The plugin is the authority on whether an operation is allowed (execution state, active capture, unresolved
     instrumentation, held input, pending checkpoint); this module validates arguments first and never assumes an
     operation completed: it returns only what the plugin reports after completion.
   * Checkpoint files live in the session's own run directory (<run_dir>/home/sta/<system>/<id>.sta, MAME's
     -state_directory) with a metadata sidecar in <run_dir>/checkpoints/<id>.json. The id is
-    <run_id>-cpNNN, so it names its owning session; loading an id from an earlier session copies the file into the
-    current session after validating it. Nothing outside the configured runs directory is ever read.
+    <run_id>-cpNNN, so it names its OWNING session, but an id never selects the session a load goes to: the target is the
+    explicitly given (or sole live) session, and a checkpoint of another session, live or ended, is copied into the target
+    only after its machine, MAME version, size and SHA-256 validate. Nothing outside the configured runs directory is read.
 """
 from __future__ import annotations
 
@@ -27,7 +32,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
-from . import png, protocol
+from . import pathutil, png, protocol
 from .bridge import BridgeClient
 from .protocol import BridgeError
 
@@ -69,23 +74,22 @@ class StateOperations:
     _shutting_down: bool
 
     def _init_operations(self) -> None:
-        self._op_lock = threading.Lock()
-        self._op_name: str | None = None
+        pass  # per-session state (operation lock, checkpoints) lives on the Session
 
     # ------------------------------------------------------------------ serialisation
     @contextlib.contextmanager
-    def exclusive(self, name: str, timeout: float | None = None) -> Iterator[None]:
-        """One state-changing operation at a time. A second caller waits (bounded) and is then refused with a clear
-        error rather than interleaving with the first."""
-        if not self._op_lock.acquire(timeout=EXCLUSIVE_WAIT_S if timeout is None else timeout):
-            raise BridgeError("operation_in_progress", f"{self._op_name or 'another state-changing operation'} is still running; "
-                              f"{name} was not started. Retry when it has finished.")
-        self._op_name = name
+    def exclusive(self, s: "Session", name: str, timeout: float | None = None) -> Iterator[None]:
+        """One state-changing operation at a time on session `s`. A second caller for the same session waits (bounded) and is
+        then refused with a clear error rather than interleaving with the first; other sessions are not affected."""
+        if not s.op_lock.acquire(timeout=EXCLUSIVE_WAIT_S if timeout is None else timeout):
+            raise BridgeError("operation_in_progress", f"{s.op_name or 'another state-changing operation'} is still running on session "
+                              f"{s.session_id or s.run_id}; {name} was not started. Retry when it has finished.")
+        s.op_name = name
         try:
             yield
         finally:
-            self._op_name = None
-            self._op_lock.release()
+            s.op_name = None
+            s.op_lock.release()
 
     def _assert_ready(self, s: "Session") -> None:
         """Raised between polls so a stop_session / shutdown / MAME exit ends a wait promptly."""
@@ -126,9 +130,10 @@ class StateOperations:
                 raise BridgeError("checkpoint_timeout", f"{op} did not finish within {CHECKPOINT_WAIT_S:g} s; MAME may be hung. "
                                   "Check session_info.checkpoint before doing anything else.", detail=st, uncertain=True)
 
-    def save_checkpoint(self, label: str | None = None) -> dict[str, Any]:
+    def save_checkpoint(self, label: str | None = None, session_id: "str | Session | None" = None) -> dict[str, Any]:
         label = protocol.check_label(label)
-        with self.exclusive("save_checkpoint"), self.use_managed() as (client, s):
+        target = self.resolve_managed(session_id)
+        with self.exclusive(target, "save_checkpoint"), self.use_managed(target) as (client, s):
             s.checkpoint_seq += 1  # an id is consumed even if the attempt fails: a file may exist for it
             cid = f"{s.run_id}-cp{s.checkpoint_seq:03d}"
             res = self._ckpt_run(client, s, "checkpoint_save", {"id": cid})
@@ -166,7 +171,7 @@ class StateOperations:
         if not isinstance(reported, str):
             raise BridgeError("checkpoint_failed", "the plugin reported no state file path", uncertain=True)
         p = Path(reported).resolve()
-        if not p.is_relative_to(s.run_dir.resolve()):
+        if not pathutil.is_within(p, s.run_dir):
             raise BridgeError("checkpoint_path_outside_session", f"state file {p} is outside this session's run directory", uncertain=True)
         if not p.is_file():
             raise BridgeError("checkpoint_failed", f"MAME reported a state file that does not exist: {p}", uncertain=True)
@@ -216,10 +221,11 @@ class StateOperations:
             raise BridgeError("checkpoint_not_found", f"the state file for {cid} is missing: {src}")
         return meta, src
 
-    def load_checkpoint(self, checkpoint_id: str) -> dict[str, Any]:
+    def load_checkpoint(self, checkpoint_id: str, session_id: "str | Session | None" = None) -> dict[str, Any]:
         m = protocol.check_checkpoint_id(checkpoint_id)
         cid, run = checkpoint_id, m.group("run")
-        with self.exclusive("load_checkpoint"), self.use_managed() as (client, s):
+        target = self.resolve_managed(session_id)  # the checkpoint id never chooses the target: omission with several sessions is refused
+        with self.exclusive(target, "load_checkpoint"), self.use_managed(target) as (client, s):
             meta, src = self._locate(s, cid, run)
             if meta.get("system") != s.system:
                 raise BridgeError("checkpoint_incompatible", f"checkpoint {cid} is for machine '{meta.get('system')}', this session runs '{s.system}'")
@@ -253,7 +259,7 @@ class StateOperations:
                 raise BridgeError("session_changed", f"MAME session changed from {s.session_id} to {sid} during the load", uncertain=True)
             out = {
                 "state": "completed", "checkpoint_id": cid, "label": meta.get("label"), "imported_from_earlier_session": imported,
-                "session_id": sid, "state_epoch": info.get("state_epoch"), "mode": res.get("mode"),
+                "source_run_id": run, "target_run_id": s.run_id, "session_id": sid, "state_epoch": info.get("state_epoch"), "mode": res.get("mode"),
                 "verification": res.get("verification"), "execution_before": res.get("execution_before"),
                 "execution": info.get("execution"), "frames_run_during_operation": res.get("frames_run_during_operation"),
                 "invalidated_experiments": res.get("invalidated_experiments") or [],
@@ -262,13 +268,17 @@ class StateOperations:
             }
             return out
 
-    def list_checkpoints(self, include_previous_sessions: bool = True) -> dict[str, Any]:
-        """Checkpoints of the current session (when there is one) and, optionally, of earlier sessions under the runs
-        directory. Reads metadata only; works with no MAME running."""
+    def list_checkpoints(self, include_previous_sessions: bool = True, session_id: "str | Session | None" = None) -> dict[str, Any]:
+        """Checkpoints of every live session and, optionally, of earlier sessions under the runs directory. Reads metadata only;
+        works with no MAME running and never needs a session to be selected. With `session_id` each entry also says whether it is
+        `compatible` with that session (same machine and MAME version), which is what load_checkpoint will require."""
+        target: Session | None = None
+        if session_id is not None:
+            target = self.resolve_managed(session_id)
         with self._cond:
-            s = self._current  # type: ignore[attr-defined]
-            current = s.run_id if s is not None else None
-            mine = [self._public(m, s) for m in (s.checkpoints.values() if s is not None else [])]
+            live = list(self._sessions.values())
+            live_runs = {s.run_id for s in live}
+            mine = [self._public(m, s) | {"owner_session_id": s.session_id} for s in live for m in s.checkpoints.values()]
         out: list[dict[str, Any]] = sorted(mine, key=lambda r: r["created_utc"] or "", reverse=True)
         scanned = 0
         if include_previous_sessions:
@@ -280,7 +290,7 @@ class StateOperations:
                 pass
             for f in files:
                 scanned += 1
-                if f.parent.parent.name == current:
+                if f.parent.parent.name in live_runs:
                     continue
                 try:
                     meta = json.loads(f.read_text())
@@ -288,11 +298,20 @@ class StateOperations:
                         out.append(self._public(meta))
                 except (OSError, ValueError, KeyError, TypeError):
                     continue
-        return {"current_run_id": current, "checkpoints": out[:MAX_LISTED_CHECKPOINTS], "truncated": len(out) > MAX_LISTED_CHECKPOINTS,
-                "sidecars_scanned": scanned, "note": "load_checkpoint accepts any listed id whose machine and MAME version match the running session"}
+        if target is not None:
+            for r in out:
+                r["current_session"] = r.get("run_id") == target.run_id
+                r["compatible"] = r.get("system") == target.system and (not r.get("mame_version") or not target.mame_version
+                                                                         or r["mame_version"] == target.mame_version)
+        return {"target_run_id": target.run_id if target is not None else None, "live_run_ids": sorted(live_runs),
+                "checkpoints": out[:MAX_LISTED_CHECKPOINTS], "truncated": len(out) > MAX_LISTED_CHECKPOINTS,
+                "sidecars_scanned": scanned,
+                "note": "load_checkpoint needs an explicit session_id when several sessions are live, and accepts any listed id whose "
+                        "machine and MAME version match that session"}
 
     # ------------------------------------------------------------------ inputs
-    def press_inputs(self, inputs: Any, frames: Any, wait: bool = True, max_wait_s: float | None = None) -> dict[str, Any]:
+    def press_inputs(self, inputs: Any, frames: Any, wait: bool = True, max_wait_s: float | None = None,
+                     session_id: "str | Session | None" = None) -> dict[str, Any]:
         args = protocol.press_args(inputs, frames)
         if not isinstance(wait, bool):
             raise BridgeError("bad_argument", "wait must be true or false")
@@ -300,11 +319,12 @@ class StateOperations:
             max_wait_s = min(60.0, args["frames"] / 30.0 + 5.0)
         if isinstance(max_wait_s, bool) or not isinstance(max_wait_s, (int, float)) or not 0 < max_wait_s <= 120:
             raise BridgeError("bad_argument", "max_wait_s must be a number in (0, 120]")
-        with self.exclusive("press_inputs"), self.use_managed() as (client, _s):
+        target = self.resolve_managed(session_id)
+        with self.exclusive(target, "press_inputs"), self.use_managed(target) as (client, _s):
             res = client.request("input_press", args, mutating=True)
-        return self._after_arm(res, wait, max_wait_s)
+        return self._after_arm(target, res, wait, max_wait_s)
 
-    def _after_arm(self, res: dict[str, Any], wait: bool, max_wait_s: float) -> dict[str, Any]:
+    def _after_arm(self, s: "Session", res: dict[str, Any], wait: bool, max_wait_s: float) -> dict[str, Any]:
         """Common tail of press_inputs / press_sequence: report immediately when stopped, nothing to wait for, or asked not to
         wait; otherwise poll (bounded) until the hold ends. Never resumes, pauses or steps emulation."""
         if not wait or res.get("state") != "holding" or res.get("waiting_for_emulation"):
@@ -313,9 +333,10 @@ class StateOperations:
                 res["note"] = ("execution is stopped, so no frame can elapse: the inputs are held and the frame count starts when emulation runs "
                                "(execution_control resume); they are released after the frames, by release_inputs, or by stop_session")
             return res
-        return self._wait_input(time.monotonic() + max_wait_s)
+        return self._wait_input(s, time.monotonic() + max_wait_s)
 
-    def press_sequence(self, steps: Any, wait: bool = True, max_wait_s: float | None = None) -> dict[str, Any]:
+    def press_sequence(self, steps: Any, wait: bool = True, max_wait_s: float | None = None,
+                       session_id: "str | Session | None" = None) -> dict[str, Any]:
         """Arm a validated frame-based input sequence (see protocol.sequence_args and the plugin's input_sequence).
 
         The whole sequence is validated here and again in the plugin before any input is pressed. Like press_inputs it never
@@ -328,18 +349,19 @@ class StateOperations:
             max_wait_s = min(120.0, total / 30.0 + 5.0)
         if isinstance(max_wait_s, bool) or not isinstance(max_wait_s, (int, float)) or not 0 < max_wait_s <= 120:
             raise BridgeError("bad_argument", "max_wait_s must be a number in (0, 120]")
-        with self.exclusive("press_sequence"), self.use_managed() as (client, _s):
+        target = self.resolve_managed(session_id)
+        with self.exclusive(target, "press_sequence"), self.use_managed(target) as (client, _s):
             res = client.request("input_sequence", args, mutating=True)
-        return self._after_arm(res, wait, max_wait_s)
+        return self._after_arm(target, res, wait, max_wait_s)
 
-    def _wait_input(self, deadline: float) -> dict[str, Any]:
+    def _wait_input(self, s: "Session", deadline: float) -> dict[str, Any]:
         while True:
             time.sleep(POLL_S)
             try:
-                with self.use_managed() as (client, _s):  # in-flight only per poll, so stop_session is never held up by a wait
+                with self.use_managed(s) as (client, _s):  # in-flight only per poll, so stop_session is never held up by a wait
                     st = client.request("input_status", {}, retry_safe=True)
             except BridgeError:
-                self._cancel_quietly()  # an error while the inputs are held must not leave them held
+                self._cancel_quietly(s)  # an error while the inputs are held must not leave them held
                 raise
             if st.get("state") != "holding":
                 st["waited"] = True
@@ -351,15 +373,16 @@ class StateOperations:
                 st.update(waited=True, note="still holding after max_wait_s (emulation slower than expected); the plugin releases after the requested frames, or call release_inputs")
                 return st
 
-    def _cancel_quietly(self) -> None:
+    def _cancel_quietly(self, s: "Session") -> None:
         try:
-            with self.use_managed() as (client, _s):
+            with self.use_managed(s) as (client, _s):
                 client.request("input_cancel", {}, timeout=5.0, mutating=True)
         except BridgeError:
             pass  # session ended or stopping: teardown / the plugin's own disconnect handling releases
 
-    def release_inputs(self) -> dict[str, Any]:
-        with self.exclusive("release_inputs"), self.use_managed() as (client, _s):
+    def release_inputs(self, session_id: "str | Session | None" = None) -> dict[str, Any]:
+        target = self.resolve_managed(session_id)
+        with self.exclusive(target, "release_inputs"), self.use_managed(target) as (client, _s):
             return client.request("input_cancel", {}, mutating=True)
 
     @staticmethod
@@ -376,19 +399,22 @@ class StateOperations:
         return out
 
     # ------------------------------------------------------------------ RAM writes
-    def write_memory(self, cpu: str, space: str, address: Any, value: Any, width: Any) -> dict[str, Any]:
+    def write_memory(self, cpu: str, space: str, address: Any, value: Any, width: Any,
+                     session_id: "str | Session | None" = None) -> dict[str, Any]:
         args = protocol.write_memory_args(cpu, space, address, value, width)
-        with self.exclusive("write_memory"), self.use_managed() as (client, _s):
+        target = self.resolve_managed(session_id)
+        with self.exclusive(target, "write_memory"), self.use_managed(target) as (client, _s):
             return client.request("write_memory", args, mutating=True)
 
     # ------------------------------------------------------------------ screenshots
-    def capture_screenshot(self, screen: Any = None) -> tuple[dict[str, Any], bytes]:
+    def capture_screenshot(self, screen: Any = None, session_id: "str | Session | None" = None) -> tuple[dict[str, Any], bytes]:
         """Ask the plugin to write one PNG of the emulated screen into <evidence>/screenshots, then validate it. Returns
         (metadata, png_bytes). Runs under the same one-at-a-time lock as checkpoints, input presses and RAM writes (so a
         capture never overlaps a checkpoint load) and as an in-flight call, so stop_session waits for it. It never pauses,
         resumes or steps emulation: it reports the state it found and whether it was unchanged afterwards."""
         args = protocol.screenshot_args(screen)
-        with self.exclusive("capture_screenshot"), self.use_managed() as (client, s):
+        target = self.resolve_managed(session_id)
+        with self.exclusive(target, "capture_screenshot"), self.use_managed(target) as (client, s):
             res = client.request("screenshot", args, timeout=SCREENSHOT_TIMEOUT_S, mutating=True)
             path = self._owned_screenshot(s, res.get("path"))
             data = path.read_bytes()
@@ -416,11 +442,12 @@ class StateOperations:
     def _owned_screenshot(s: "Session", reported: Any) -> Path:
         if not isinstance(reported, str):
             raise BridgeError("screenshot_failed", "the plugin reported no screenshot path", uncertain=True)
-        folder = (s.evidence_dir / SCREENSHOT_DIRNAME).resolve()
+        folder = s.evidence_dir / SCREENSHOT_DIRNAME
         p = Path(reported).resolve()
-        if p.parent != folder or p.suffix.lower() != ".png":
+        if not pathutil.is_directly_in(p, folder) or p.suffix.lower() != ".png":
             raise BridgeError("screenshot_path_outside_session",
-                              f"screenshot {p} is not a PNG directly inside this session's screenshot directory {folder}", uncertain=True)
+                              f"screenshot {p} is not a PNG directly inside this session's screenshot directory {folder.resolve()}",
+                              uncertain=True, detail={"reported": reported})
         if not p.is_file():
             raise BridgeError("screenshot_failed", f"MAME reported a screenshot that does not exist: {p}", uncertain=True)
         return p

@@ -1,5 +1,6 @@
 """Unit tests for the managed-session lifecycle and ownership logic (fake process, fake bridge client, fake
 process table). They prove the decision logic only; scripts/mcp_session_e2e.py exercises real MAME."""
+import itertools
 import subprocess
 import sys
 import threading
@@ -43,7 +44,8 @@ class FakeProc:
 
 class FakeClient:
     def __init__(self, machine="shinobi", test_hooks=None, debugger=True, connect_errors=0, active="exp-s1-001",
-                 cancel_verified=True, cancel_error=None, loading_polls=None):
+                 cancel_verified=True, cancel_error=None, loading_polls=None, sid="s1-aaaaaa"):
+        self.sid = sid
         self.loading_polls = loading_polls  # None: ready at once; N: the first connect + N-1 session_info replies list no devices / no debugger yet
         self.machine, self.test_hooks, self.debugger = machine, test_hooks or [], debugger
         self.connect_errors, self.active = connect_errors, active
@@ -57,7 +59,7 @@ class FakeClient:
             self.connect_errors -= 1
             time.sleep(0.01)
             raise BridgeError("connect_failed", "nobody listening")
-        self.session_id, self.connected = "s1-aaaaaa", True
+        self.session_id, self.connected = self.sid, True
         return self._info()
 
     def _info(self):
@@ -109,29 +111,38 @@ class FakeIdent(session.ProcessIdentity):
 
 
 class Rig:
-    def __init__(self, tmp_path, **client_kw):
+    client_cls = FakeClient
+
+    def __init__(self, tmp_path, max_sessions=3, unique_ids=False, **client_kw):
         (tmp_path / "roms").mkdir(exist_ok=True)
         (tmp_path / "roms" / "shinobi.zip").write_bytes(b"x")
         (tmp_path / "mame").mkdir(exist_ok=True)
         (tmp_path / "mame" / launcher.MAME_EXE_NAME).write_bytes(b"stub")  # presence check only; nothing is executed
         self.cfg = SessionConfig(mame_dir=tmp_path / "mame", rompaths=[tmp_path / "roms"], runs_dir=tmp_path / "runs",
-                                 plugins=tmp_path / "mame" / "plugins")
+                                 plugins=tmp_path / "mame" / "plugins", max_sessions=max_sessions)
+        self.unique_ids, self._ids, self._ports = unique_ids, itertools.count(1), itertools.count(5555)
+        self._launch_lock = threading.Lock()  # concurrent starts (multi-session tests) share these lists and the fake pid counter
         self.ident, self.launches, self.procs, self.clients = FakeIdent(), [], [], []
         self.proc_kw, self.client_kw, self.rt = {}, client_kw, None
         self.mgr = SessionManager(self.cfg, launch_fn=self._launch, client_factory=self._client, identity=self.ident,
-                                  port_picker=lambda: 5555)
+                                  port_picker=lambda: next(self._ports))
 
     def _launch(self, **kw):
-        self.launches.append(kw)
-        p = FakeProc(**self.proc_kw)
-        self.procs.append(p)
-        self.ident.images[p.pid] = str(self.rt or self.cfg.mame_exe)  # a wrapper rig reports its runtime, as /proc does after the exec
-        self.ident.created_map[p.pid] = 777
-        self.ident.owners[kw["port"]] = {p.pid}
+        with self._launch_lock:
+            self.launches.append(kw)
+            p = FakeProc(**self.proc_kw)
+            self.procs.append(p)
+            self.ident.images[p.pid] = str(self.rt or self.cfg.mame_exe)  # a wrapper rig reports its runtime, as /proc does after the exec
+            self.ident.created_map[p.pid] = 777
+            self.ident.owners[kw["port"]] = {p.pid}
         return p, {"pid_created_filetime": 777, "romset_zip": {"sha1": "abc"}, "verifyroms": {"output": "romset shinobi is good"}}
 
     def _client(self, port, pid, created):
-        c = FakeClient(**self.client_kw)
+        kw = dict(self.client_kw)
+        if self.unique_ids:  # distinct bridge session ids, as real MAME processes have
+            n = next(self._ids)
+            kw["sid"] = f"s{1700000000 + n}-{n:06x}"
+        c = self.client_cls(**kw)
         self.clients.append(c)
         return c
 
@@ -187,11 +198,12 @@ def test_start_launches_production_session_and_reports_identity(rig, tmp_path):
     assert snap["state"] == READY and snap["ownership"] == "managed" and snap["session_id"] == "s1-aaaaaa"
 
 
-def test_second_start_is_rejected_while_active_and_launches_nothing(rig):
+def test_second_start_beyond_the_limit_is_rejected_and_launches_nothing(tmp_path):
+    rig = Rig(tmp_path, max_sessions=1)
     rig.mgr.start("shinobi")
     with pytest.raises(BridgeError) as e:
         rig.mgr.start("shinobi")
-    assert e.value.code == "session_active" and len(rig.launches) == 1 and rig.procs[0].calls == []
+    assert e.value.code == "session_limit_reached" and len(rig.launches) == 1 and rig.procs[0].calls == []
 
 
 def test_start_stop_start_in_one_manager(rig):
@@ -405,9 +417,9 @@ def test_stop_waits_for_in_flight_call_and_refuses_new_ones(rig):
         with rig.mgr.use_client(None):
             pass
     assert e.value.code == "session_stopping"
-    with pytest.raises(BridgeError) as e2:  # and a second start/stop cannot interleave
-        rig.mgr.start("shinobi")
-    assert e2.value.code == "session_active"
+    with pytest.raises(BridgeError) as e2:  # and a second stop cannot interleave
+        rig.mgr.stop()
+    assert e2.value.code == "session_stopping"
     release.set()
     assert done.wait(3)
     t.join()
@@ -433,7 +445,7 @@ def test_stop_continues_after_drain_timeout_and_says_so(rig):
 
 def test_concurrent_stop_is_rejected(rig):
     rig.mgr.start("shinobi")
-    rig.mgr._current.state = session.STOPPING
+    next(iter(rig.mgr._sessions.values())).state = session.STOPPING
     with pytest.raises(BridgeError) as e:
         rig.mgr.stop()
     assert e.value.code == "session_stopping"
@@ -442,7 +454,8 @@ def test_concurrent_stop_is_rejected(rig):
 # ---------------------------------------------------------------------------------------------- shutdown
 def test_shutdown_stops_owned_process_once_and_blocks_new_starts(rig):
     rig.mgr.start("shinobi")
-    rep = rig.mgr.shutdown()
+    run_id = rig.mgr.snapshot()["run_id"]
+    rep = rig.mgr.shutdown()["sessions"][run_id]
     assert rep["process"]["terminated"] is True and rig.procs[0].calls == ["terminate"]
     assert rig.mgr.shutdown() is None
     with pytest.raises(BridgeError) as e:
@@ -850,7 +863,7 @@ def test_server_shutdown_uses_the_same_ordering(tmp_path):
     rig = ResetRig(tmp_path)
     rig.mgr.start("shinobi")
     rig.checks.clear()
-    rep = rig.mgr.shutdown()
+    rep = next(iter(rig.mgr.shutdown()["sessions"].values()))
     assert rep["process"]["terminated"] is True and rep["cleanup_failures"] == []
     assert rep["process"]["identity_check"] == "image, creation time and bridge port verified" and rig.checks == [True]
 
