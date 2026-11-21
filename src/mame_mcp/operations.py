@@ -302,6 +302,11 @@ class StateOperations:
             raise BridgeError("bad_argument", "max_wait_s must be a number in (0, 120]")
         with self.exclusive("press_inputs"), self.use_managed() as (client, _s):
             res = client.request("input_press", args, mutating=True)
+        return self._after_arm(res, wait, max_wait_s)
+
+    def _after_arm(self, res: dict[str, Any], wait: bool, max_wait_s: float) -> dict[str, Any]:
+        """Common tail of press_inputs / press_sequence: report immediately when stopped, nothing to wait for, or asked not to
+        wait; otherwise poll (bounded) until the hold ends. Never resumes, pauses or steps emulation."""
         if not wait or res.get("state") != "holding" or res.get("waiting_for_emulation"):
             res["waited"] = False
             if res.get("waiting_for_emulation"):
@@ -309,6 +314,23 @@ class StateOperations:
                                "(execution_control resume); they are released after the frames, by release_inputs, or by stop_session")
             return res
         return self._wait_input(time.monotonic() + max_wait_s)
+
+    def press_sequence(self, steps: Any, wait: bool = True, max_wait_s: float | None = None) -> dict[str, Any]:
+        """Arm a validated frame-based input sequence (see protocol.sequence_args and the plugin's input_sequence).
+
+        The whole sequence is validated here and again in the plugin before any input is pressed. Like press_inputs it never
+        advances emulation: arming while stopped sets only the offset-0 presses and nothing elapses until emulation runs."""
+        args = protocol.sequence_args(steps)
+        if not isinstance(wait, bool):
+            raise BridgeError("bad_argument", "wait must be true or false")
+        total = max(s["start"] + s["frames"] for s in args["steps"])
+        if max_wait_s is None:
+            max_wait_s = min(120.0, total / 30.0 + 5.0)
+        if isinstance(max_wait_s, bool) or not isinstance(max_wait_s, (int, float)) or not 0 < max_wait_s <= 120:
+            raise BridgeError("bad_argument", "max_wait_s must be a number in (0, 120]")
+        with self.exclusive("press_sequence"), self.use_managed() as (client, _s):
+            res = client.request("input_sequence", args, mutating=True)
+        return self._after_arm(res, wait, max_wait_s)
 
     def _wait_input(self, deadline: float) -> dict[str, Any]:
         while True:

@@ -38,6 +38,12 @@ local LIMITS = {
 	max_input_frames = 600,          -- emulated frames one press may be held (10 s at 60 Hz)
 	input_latency_frames = 3,        -- frames after arming that may read idle before the hold is counted regardless
 	max_listed_fields = 600,
+	max_sequence_steps = 64,         -- press_sequence: steps (one press of one field each); at most 2 transitions per step
+	max_sequence_frames = 3600,      -- press_sequence: total length in emulated frames (60 s at 60 Hz)
+	max_sequence_fields = 16,        -- press_sequence: distinct fields used (at most max_input_fields of them held at once)
+	max_watch_registers = 6,         -- capture_watchpoint: counter + hit-time pc + access address + access data + registers <= 10 debugger temporaries
+	max_disasm_instructions = 64,    -- disassemble: instructions returned per call
+	max_disasm_bytes_per_instruction = 16,   -- disassemble: bytes requested per instruction when sizing the disassembly range
 	max_write_bytes = 4,         -- write_memory width: 1, 2 or 4 bytes
 	checkpoint_timeout_ms = 10000,   -- host time allowed for a deferred (scheduled) save/load to complete
 	checkpoint_window_frames = 6,    -- deferred load: emulated frames past the checkpoint frame still accepted as "restored"
@@ -265,7 +271,7 @@ function exports.startplugin()
 			local e = experiments[id]
 			if e and e.state == "running" and e.cpu == tag then
 				for _, loc in ipairs(e.locs or {}) do
-					if loc.bp_index then owned[loc.bp_index] = id end
+					if loc.bp_index and loc.kind ~= "wp" then owned[loc.bp_index] = id end
 				end
 			end
 		end
@@ -277,6 +283,48 @@ function exports.startplugin()
 		end
 		table.sort(out, function(a, b) return a.index < b.index end)
 		return out
+	end
+
+	-- MAME 0.289's wplist() DEREFERENCES A NULL POINTER and kills the whole MAME process (access violation, which no pcall can
+	-- catch) for any (cpu, space) in which no watchpoint has ever been set: the per-space table is created by the first wpset and
+	-- then persists (verified: wpset, wpclear, wplist is safe; wplist on a fresh program/io space crashes). So wplist is only ever
+	-- called on a (cpu, space) THIS BRIDGE has successfully wpset in; watchpoints a user sets in any other space cannot be listed.
+	local wp_touched = {}  -- "<cpu tag>/<space>" -> true
+
+	-- watchpoints currently installed by/with this bridge on a cpu, flagged when owned by an experiment of this bridge.
+	-- Breakpoint and watchpoint indices are separate counters in MAME, so ownership is matched on (kind, space, index).
+	local function list_watchpoints(dev, tag)
+		local out = {}
+		local dbgi, dberr = iface(dev, "debug")
+		if dberr then return { unavailable = true, reason = "debug interface read failed: " .. dberr } end
+		if not dbgi then return { unavailable = true, reason = "device has no debug interface (it cannot hold watchpoints)", interface = "absent" } end
+		local owned = {}
+		for _, id in ipairs(order) do
+			local e = experiments[id]
+			if e and e.state == "running" and e.cpu == tag then
+				for _, loc in ipairs(e.locs or {}) do
+					if loc.bp_index and loc.kind == "wp" then owned[loc.space .. "/" .. loc.bp_index] = id end
+				end
+			end
+		end
+		local names = {}
+		for _, name in ipairs({ "data", "io", "program" }) do
+			if dev.spaces[name] and wp_touched[tag .. "/" .. name] then names[#names + 1] = name end
+		end
+		for _, name in ipairs(names) do
+			local ok, list = pcall(function() return dbgi:wplist(dev.spaces[name]) end)
+			if ok and list then
+				for idx, wp in pairs(list) do
+					out[#out + 1] = {
+						space = name, index = idx, address = hex(wp.address), length = wp.length, type = wp.type,
+						condition = wp.condition, action = wp.action, enabled = wp.enabled, owned_by_experiment = owned[name .. "/" .. idx],
+					}
+				end
+			end
+		end
+		table.sort(out, function(a, b) if a.space ~= b.space then return a.space < b.space end return a.index < b.index end)
+		return { listed = out, spaces_covered = names,
+			coverage = "only address spaces in which this bridge has set a watchpoint: MAME 0.289 crashes if watchpoints are listed for a space that never had one, so a watchpoint set by someone else in any other space is not visible here" }
 	end
 
 	local orphan_rows  -- defined with the unresolved-instrumentation registry below
@@ -297,6 +345,7 @@ function exports.startplugin()
 					address_spaces = list_spaces(dev),
 					state_interface = (st ~= nil) and "present" or (sterr and "read_error" or "absent"),
 					breakpoints = machine().debugger and list_breakpoints(dev, tag) or { unavailable = true, reason = "no debugger (start MAME with -debug)" },
+					watchpoints = machine().debugger and list_watchpoints(dev, tag) or { unavailable = true, reason = "no debugger (start MAME with -debug)" },
 				}
 				if st then
 					entry.register_count = try(function() local n = 0 for _ in pairs(st) do n = n + 1 end return n end)
@@ -348,8 +397,9 @@ function exports.startplugin()
 				operations = { "session_info", "read_memory", "read_registers", "capture_breakpoint",
 					"experiment_status", "cancel_experiment", "execution_control", "goodbye",
 					"list_inputs", "input_press", "input_status", "input_cancel", "write_memory",
-					"checkpoint_save", "checkpoint_load", "checkpoint_status", "screen_list", "screenshot" },
-				capture_scope = "breakpoints on the program space of the named cpu; registers are read in the breakpoint condition (that cpu's own symbol table); memory fields use explicitly device-qualified, side-effect-suppressed debugger operators (tag.pb@ etc.). Verified on :maincpu (68000) and :soundcpu (Z80) of shinobi only.",
+					"checkpoint_save", "checkpoint_load", "checkpoint_status", "screen_list", "screenshot",
+					"capture_watchpoint", "disassemble", "input_sequence" },
+				capture_scope = "breakpoints on the program space of the named cpu, or watchpoints on one explicit address space/range of it (capture_watchpoint); registers are read in the breakpoint/watchpoint condition (that cpu's own symbol table); memory fields use explicitly device-qualified, side-effect-suppressed debugger operators (tag.pb@ etc.). Breakpoints verified on :maincpu (68000) and :soundcpu (Z80) of shinobi; watchpoints verified against Lua memory taps on 68000 and Z80 spaces.",
 			},
 			active_experiment = active and active.id or nil,
 			unresolved_instrumentation = orphan_rows(),
@@ -549,14 +599,26 @@ function exports.startplugin()
 		return vals
 	end
 
+	-- A temporary named in ANY installed breakpoint or watchpoint (any device, any address space) is in use by someone.
 	local function temps_referenced_by_breakpoints()
 		local used = {}
-		for _, dev in pairs(machine().devices) do
+		local function scan(list)
+			for _, bp in pairs(list) do
+				for _, text in ipairs({ bp.condition or "", bp.action or "" }) do
+					for n in text:gmatch("temp(%d)") do used[tonumber(n)] = true end
+				end
+			end
+		end
+		for dtag, dev in pairs(machine().devices) do
 			local ok, list = pcall(function() return dev.debug and dev.debug:bplist() end)
-			if ok and list then
-				for _, bp in pairs(list) do
-					for _, text in ipairs({ bp.condition or "", bp.action or "" }) do
-						for n in text:gmatch("temp(%d)") do used[tonumber(n)] = true end
+			if ok and list then scan(list) end
+			local oks, spaces = pcall(function() return dev.debug and dev.spaces end)
+			if oks and spaces then
+				for _, name in ipairs({ "data", "io", "program" }) do  -- only spaces this bridge has watched: wplist() elsewhere crashes MAME 0.289
+					local sp = spaces[name]
+					if sp and wp_touched[dtag .. "/" .. name] then
+						local okw, wl = pcall(function() return dev.debug:wplist(sp) end)
+						if okw and wl then scan(wl) end
 					end
 				end
 			end
@@ -589,6 +651,32 @@ function exports.startplugin()
 
 	-- capture_breakpoint ------------------------------------------------------
 	local MEMOP = { [1] = "b", [2] = "w", [4] = "d" }
+
+	-- Registers to record at each hit: exact state-interface names, each with its debugger-expression symbol (read in the
+	-- breakpoint/watchpoint CONDITION, which MAME compiles in this cpu's own symbol table). Returns a list, or nil + error.
+	local function resolve_capture_registers(dev, args, limit)
+		local regs = {}
+		local cst, csterr
+		if args.registers ~= nil and #args.registers > 0 then
+			cst, csterr = iface(dev, "state")
+			if csterr then return nil, { code = "state_read_error", message = args.cpu .. ": reading its state interface failed: " .. csterr } end
+			if not cst then return nil, { code = "no_state_interface", message = args.cpu .. " has no state (register) interface; capture it without registers" } end
+		end
+		for _, n in ipairs(args.registers or {}) do
+			if not valid_ident(n) or not cst[n] then
+				return nil, { code = "unknown_register", message = "register '" .. tostring(n) .. "' is not a state entry of this cpu" }
+			end
+			local ok, sym = pcall(function() return cst[n].symbol end)
+			if not ok or type(sym) ~= "string" or sym == "" or not valid_ident(sym) then
+				return nil, { code = "unknown_register", message = "register '" .. n .. "' has no debugger-expression symbol" }
+			end
+			regs[#regs + 1] = { name = n, symbol = sym:lower() }
+		end
+		if #regs > limit then
+			return nil, { code = "too_large", message = "at most " .. limit .. " registers per capture (each needs a borrowed debugger temporary)" }
+		end
+		return regs
+	end
 
 	local function build_capture(dev, args)
 		local dbg = machine().debugger
@@ -623,14 +711,14 @@ function exports.startplugin()
 				if addrs[a] then return fail("bad_argument", "duplicate location address " .. hex(a)) end
 				if a > space.address_mask then return fail("out_of_range", "location " .. lid .. " address exceeds program space mask") end
 				ids[lid], addrs[a] = true, true
-				locs[#locs + 1] = { id = lid, address = a }
+				locs[#locs + 1] = { id = lid, address = a, kind = "bp" }
 			end
 			multi = true
 		else
 			local addr, e = parse_uint(args.address, "address")
 			if not addr then return nil, e end
 			if addr > space.address_mask then return fail("out_of_range", "address exceeds program space mask") end
-			locs[1] = { id = "L1", address = addr }
+			locs[1] = { id = "L1", address = addr, kind = "bp" }
 		end
 		local max_events, e2 = parse_uint(args.max_events, "max_events")
 		if not max_events then return nil, e2 end
@@ -641,26 +729,8 @@ function exports.startplugin()
 		if type(max_wall) ~= "number" or max_wall <= 0 or max_wall > LIMITS.max_wall_seconds then
 			return fail("bad_argument", "max_wall_seconds must be a number in (0, " .. LIMITS.max_wall_seconds .. "]")
 		end
-		local regs = {}
-		local cst, csterr
-		if args.registers ~= nil and #args.registers > 0 then
-			cst, csterr = iface(dev, "state")
-			if csterr then return fail("state_read_error", args.cpu .. ": reading its state interface failed: " .. csterr) end
-			if not cst then return fail("no_state_interface", args.cpu .. " has no state (register) interface; capture it without registers") end
-		end
-		for _, n in ipairs(args.registers or {}) do
-			if not valid_ident(n) or not cst[n] then
-				return fail("unknown_register", "register '" .. tostring(n) .. "' is not a state entry of this cpu")
-			end
-			local ok, sym = pcall(function() return cst[n].symbol end)
-			if not ok or type(sym) ~= "string" or sym == "" or not valid_ident(sym) then
-				return fail("unknown_register", "register '" .. n .. "' has no debugger-expression symbol")
-			end
-			regs[#regs + 1] = { name = n, symbol = sym:lower() }
-		end
-		if #regs > LIMITS.max_capture_registers then
-			return fail("too_large", "at most " .. LIMITS.max_capture_registers .. " registers per capture (each needs a borrowed debugger temporary)")
-		end
+		local regs, rerr = resolve_capture_registers(dev, args, LIMITS.max_capture_registers)
+		if not regs then return nil, rerr end
 		local mems = {}
 		for _, mf in ipairs(args.memory or {}) do
 			if type(mf) ~= "table" then return fail("bad_argument", "memory entries must be objects") end
@@ -695,6 +765,104 @@ function exports.startplugin()
 			locs = locs, multi = multi, max_events = max_events, max_wall = max_wall, regs = regs, mems = mems,
 			label = type(args.label) == "string" and args.label:sub(1, 80) or nil,
 		}
+	end
+
+	-- capture_watchpoint: validate ONE explicit (cpu, address space, address range, access type). Nothing is defaulted and no
+	-- bank or mirror is inferred: the range is matched against the logical address the CPU issues.
+	local WATCH_SPACES = { program = true, data = true, io = true }
+	local WATCH_ACCESS = { read = { "r" }, write = { "w" }, read_write = { "r", "w" } }
+	local WATCH_LOC_ID = { r = "read", w = "write" }
+
+	local function build_watch(dev, args)
+		local dbg = machine().debugger
+		if not dbg then
+			return fail("debugger_unavailable", "MAME was started without -debug; watchpoints are unavailable")
+		end
+		if active then return fail("experiment_active", "experiment " .. active.id .. " is still running") end
+		local dbgi, dberr = iface(dev, "debug")
+		if dberr then return fail("debug_interface_error", args.cpu .. ": reading its debug interface failed: " .. dberr) end
+		if not dbgi then return fail("no_debug_interface", args.cpu .. " has no debug interface, so watchpoints cannot be set on it") end
+		local space_name = args.space
+		if type(space_name) ~= "string" or not WATCH_SPACES[space_name] then
+			return fail("bad_argument", "space must be one of program, data, io (the separate opcodes and cpu_space views and other spaces cannot be watched)")
+		end
+		local sp = dev.spaces[space_name]
+		if not sp then
+			local have = {}
+			for n in pairs(dev.spaces) do have[#have + 1] = n end
+			table.sort(have)
+			return fail("unknown_space", "cpu " .. args.cpu .. " has no address space '" .. space_name .. "'", { spaces = have })
+		end
+		if sp.shift ~= 0 then
+			return fail("unsupported_space", string.format("%s/%s has address shift %d (address units are not bytes); watching it is not supported", args.cpu, space_name, sp.shift))
+		end
+		local start, e1 = parse_uint(args.address, "address")
+		if not start then return nil, e1 end
+		local length, e2 = parse_uint(args.length, "length")
+		if not length then return nil, e2 end
+		if length < 1 then return fail("bad_argument", "length must be >= 1 (address units of the space; shift 0, so bytes)") end
+		local last = start + length - 1
+		if last > sp.address_mask then
+			return fail("out_of_range", string.format("range %s-%s exceeds the address mask %s of %s/%s", hex(start), hex(last), hex(sp.address_mask), args.cpu, space_name))
+		end
+		local kinds = WATCH_ACCESS[args.access]
+		if not kinds then return fail("bad_argument", "access must be 'read', 'write' or 'read_write'") end
+		local max_events, e3 = parse_uint(args.max_events, "max_events")
+		if not max_events then return nil, e3 end
+		if max_events < 1 or max_events > LIMITS.max_events then
+			return fail("bad_argument", "max_events must be 1.." .. LIMITS.max_events)
+		end
+		local max_wall = args.max_wall_seconds
+		if type(max_wall) ~= "number" or max_wall <= 0 or max_wall > LIMITS.max_wall_seconds then
+			return fail("bad_argument", "max_wall_seconds must be a number in (0, " .. LIMITS.max_wall_seconds .. "]")
+		end
+		local regs, rerr = resolve_capture_registers(dev, args, LIMITS.max_watch_registers)
+		if not regs then return nil, rerr end
+		-- 'read_write' is two MAME watchpoints (one per access type) because MAME's expression language does not say which kind of
+		-- access fired: the access type of an event is the literal id baked into that watchpoint's own action, never inferred.
+		local locs = {}
+		for _, k in ipairs(kinds) do
+			locs[#locs + 1] = { id = WATCH_LOC_ID[k], kind = "wp", wptype = k, access = WATCH_LOC_ID[k], space = space_name,
+				address = start, length = length, last = last }
+		end
+		return {
+			locs = locs, multi = true, watch = true, max_events = max_events, max_wall = max_wall, regs = regs, mems = {},
+			space = space_name, start = start, length = length, last = last, access = args.access, shift = sp.shift,
+			label = type(args.label) == "string" and args.label:sub(1, 80) or nil,
+		}
+	end
+
+	-- One instrument (breakpoint or watchpoint) of an experiment: remove it, ask whether it is still listed.
+	-- The index namespaces of breakpoints and watchpoints are separate in MAME; `kind` says which one `bp_index` belongs to.
+	local function clear_verb(loc) return loc.kind == "wp" and "wpclear" or "bpclear" end
+
+	local function safe_clear(dev, loc, ord)
+		if cfg.test_fail_clear and ord == cfg.test_fail_clear then error("injected test failure: " .. clear_verb(loc) .. " suppressed for location " .. ord) end
+		if loc.kind == "wp" then dev.debug:wpclear(loc.bp_index) else dev.debug:bpclear(loc.bp_index) end
+	end
+
+	-- true if the instrument is still installed (strict: and still describes the same address); raises if that cannot be determined
+	local function loc_listed(dev, loc, strict)
+		local b
+		if loc.kind == "wp" then b = dev.debug:wplist(dev.spaces[loc.space])[loc.bp_index]
+		else b = dev.debug:bplist()[loc.bp_index] end
+		if b == nil then return false end
+		return (not strict) or b.address == loc.address
+	end
+
+	local function index_key(loc) -- the status/cleanup key under which an instrument's MAME index is reported
+		if loc.kind == "wp" then return "watchpoint_index" end
+		return "breakpoint_index"
+	end
+
+	-- common descriptive fields of one location row (status, manifest, cleanup, unresolved instrumentation)
+	local function loc_row(loc)
+		local row = { id = loc.id, address = hex(loc.address) }
+		row[index_key(loc)] = loc.bp_index
+		if loc.kind == "wp" then
+			row.kind, row.space, row.length, row.access = "watchpoint", loc.space, loc.length, loc.access
+		end
+		return row
 	end
 
 	local function release_temps(exp, cleanup)
@@ -742,28 +910,25 @@ function exports.startplugin()
 	-- exist, new captures are refused; resolve_orphans() re-checks (and retries the clear) on every capture request.
 	local orphans = {}  -- list of { exp_id, cpu, source, locs = {{id,address,bp_index,ord}}, temps = {n,...} }
 
-	local function safe_bpclear(dev, idx, ord)
-		if cfg.test_fail_clear and ord == cfg.test_fail_clear then error("injected test failure: bpclear suppressed for location " .. ord) end
-		dev.debug:bpclear(idx)
-	end
-
 	orphan_rows = function()
 		local out = {}
 		for _, g in ipairs(orphans) do
 			if #g.locs == 0 then
 				out[#out + 1] = { experiment_id = g.exp_id, cpu = g.cpu, source = g.source, debugger_temporaries = g.temps,
-					note = "breakpoints are gone but the retained temporaries could not yet be confirmed zero" }
+					note = "breakpoints/watchpoints are gone but the retained temporaries could not yet be confirmed zero" }
 			end
 			for _, l in ipairs(g.locs) do
-				out[#out + 1] = { experiment_id = g.exp_id, cpu = g.cpu, location = l.id, address = hex(l.address),
-					breakpoint_index = l.bp_index, source = g.source, debugger_temporaries = g.temps }
+				local row = loc_row(l)
+				row.experiment_id, row.cpu, row.location, row.source, row.debugger_temporaries = g.exp_id, g.cpu, l.id, g.source, g.temps
+				row.id = nil
+				out[#out + 1] = row
 			end
 		end
 		return out
 	end
 
-	local RECOVERY = "Remove the listed breakpoints (MAME debugger: 'bpclear <index>' on that CPU) or restart MAME, then retry; "
-		.. "the next capture request re-checks the breakpoint list, retries the clear itself and zeroes the retained temporaries once nothing is left."
+	local RECOVERY = "Remove the listed breakpoints/watchpoints (MAME debugger: 'bpclear <index>' or 'wpclear <index>' on that CPU) or restart MAME, then retry; "
+		.. "the next capture request re-checks the breakpoint and watchpoint lists, retries the clear itself and zeroes the retained temporaries once nothing is left."
 
 	local function resolve_orphans()
 		local recovered = {}
@@ -773,14 +938,17 @@ function exports.startplugin()
 			for li = #g.locs, 1, -1 do
 				local l = g.locs[li]
 				local function present()
-					local ok, v = pcall(function() local b = dev.debug:bplist()[l.bp_index]; return b ~= nil and b.address == l.address end)
+					local ok, v = pcall(loc_listed, dev, l, true)
 					return (not ok) or v  -- cannot verify = treat as present
 				end
 				if dev and present() then
-					pcall(safe_bpclear, dev, l.bp_index, l.ord)
+					pcall(safe_clear, dev, l, l.ord)
 				end
 				if not dev or not present() then
-					recovered[#recovered + 1] = { experiment_id = g.exp_id, location = l.id, address = hex(l.address), breakpoint_index = l.bp_index }
+					local row = loc_row(l)
+					row.experiment_id, row.location = g.exp_id, l.id
+					row.id = nil
+					recovered[#recovered + 1] = row
 					table.remove(g.locs, li)
 				end
 			end
@@ -812,19 +980,20 @@ function exports.startplugin()
 		local all_cleared, verified_all = true, true
 		for ord, loc in ipairs(exp.locs) do
 			loc.ord = ord
-			local row = { id = loc.id, address = hex(loc.address), breakpoint_index = loc.bp_index }
+			local row = loc_row(loc)
 			cleanup.locations[#cleanup.locations + 1] = row
 			if dev and loc.bp_index then
-				local ok, e = pcall(function() safe_bpclear(dev, loc.bp_index, ord) end)
-				if not ok then cleanup.errors[#cleanup.errors + 1] = loc.id .. ": bpclear failed: " .. tostring(e) end
-				local ok2, still = pcall(function() return dev.debug:bplist()[loc.bp_index] ~= nil end)
+				local what, list_verb = (loc.kind == "wp") and "watchpoint" or "breakpoint", (loc.kind == "wp") and "wplist" or "bplist"
+				local ok, e = pcall(function() safe_clear(dev, loc, ord) end)
+				if not ok then cleanup.errors[#cleanup.errors + 1] = loc.id .. ": " .. clear_verb(loc) .. " failed: " .. tostring(e) end
+				local ok2, still = pcall(loc_listed, dev, loc, false)
 				if ok2 then
 					row.cleared = not still
-					if still then cleanup.errors[#cleanup.errors + 1] = loc.id .. ": breakpoint still present after bpclear" end
+					if still then cleanup.errors[#cleanup.errors + 1] = loc.id .. ": " .. what .. " still present after " .. clear_verb(loc) end
 				else
 					row.cleared = false
 					verified_all = false
-					cleanup.errors[#cleanup.errors + 1] = loc.id .. ": bplist verification failed: " .. tostring(still)
+					cleanup.errors[#cleanup.errors + 1] = loc.id .. ": " .. list_verb .. " verification failed: " .. tostring(still)
 				end
 				if not row.cleared then all_cleared = false end
 			else
@@ -844,11 +1013,17 @@ function exports.startplugin()
 			local left, tl = {}, { exp.temps.counter }
 			for _, t in pairs(exp.temps.regs) do tl[#tl + 1] = t end
 			for _, loc in ipairs(exp.locs) do
-				if loc.bp_index and not cleanup.locations[loc.ord].cleared then left[#left + 1] = { id = loc.id, address = loc.address, bp_index = loc.bp_index, ord = loc.ord } end
+				if loc.bp_index and not cleanup.locations[loc.ord].cleared then
+					left[#left + 1] = { id = loc.id, address = loc.address, bp_index = loc.bp_index, ord = loc.ord, kind = loc.kind, space = loc.space, length = loc.length, access = loc.access }
+				end
 			end
 			orphans[#orphans + 1] = { exp_id = exp.id, cpu = exp.cpu, source = "finalize", locs = left, temps = tl }
 			cleanup.remaining_instrumentation = {}
-			for _, l in ipairs(left) do cleanup.remaining_instrumentation[#cleanup.remaining_instrumentation + 1] = { location = l.id, address = hex(l.address), breakpoint_index = l.bp_index } end
+			for _, l in ipairs(left) do
+				local row = loc_row(l)
+				row.location, row.id = l.id, nil
+				cleanup.remaining_instrumentation[#cleanup.remaining_instrumentation + 1] = row
+			end
 			cleanup.recovery = RECOVERY
 			cleanup.debug_state = { retained = true, verified = false, registers = {}, errors = { "temporaries retained and NOT reset: instrumentation using them is still installed (see cleanup.remaining_instrumentation)" } }
 			okr = true
@@ -882,8 +1057,9 @@ function exports.startplugin()
 		mf.counts = { events_captured = exp.captured, hits_observed = exp.last_seq, events_dropped = exp.dropped }
 		mf.per_location = {}
 		for _, loc in ipairs(exp.locs) do
-			mf.per_location[#mf.per_location + 1] = { id = loc.id, address = hex(loc.address), armed = loc.bp_index ~= nil,
-				events_captured = loc.captured, no_hits_observed = (loc.captured == 0) }
+			local prow = loc_row(loc)
+			prow.armed, prow.events_captured, prow.no_hits_observed = loc.bp_index ~= nil, loc.captured, (loc.captured == 0)
+			mf.per_location[#mf.per_location + 1] = prow
 		end
 		mf.errors = exp.errors
 		mf.evidence_errors = exp.evidence_errors
@@ -940,6 +1116,18 @@ function exports.startplugin()
 				-- address it is the breakpoint address by construction (a hit means the CPU is about to execute it).
 				local rec = { seq = ev.seq, location = lid, address = loc and hex(loc.address) or nil, pc = loc and hex(loc.address) or nil, regs = {}, mem = {} }
 				local k = 2
+				if exp.watch then
+					-- watchpoint event: the location id IS the access type (literal baked into that watchpoint's action);
+					-- fields: addr|data|pc|registers...  The access address is the one captured at the hit, never the watched range start.
+					local a, d, pcv = tonumber(fields[2] or "", 16), tonumber(fields[3] or "", 16), tonumber(fields[4] or "", 16)
+					rec = { seq = ev.seq, access = loc and loc.access or nil, location = lid, space = loc and loc.space or nil,
+						address = a and hex(a) or nil, data = d and hex(d) or nil, pc = pcv and hex(pcv) or nil, regs = {} }
+					if not (a and d and pcv) then
+						exp.errors[#exp.errors + 1] = "event " .. ev.seq .. " has an unparseable address/data/pc field"
+					end
+					rec.pc_source = "captured at the hit (debugger symbol curpc)"
+					k = 5
+				end
 				for _, r in ipairs(exp.regs) do rec.regs[r.name] = "0x" .. (fields[k] or "?"); k = k + 1 end
 				for _, mf in ipairs(exp.mems) do
 					rec.mem[#rec.mem + 1] = { space = mf.space, address = hex(mf.address), size = mf.size, value = "0x" .. (fields[k] or "?") }
@@ -949,7 +1137,7 @@ function exports.startplugin()
 				rec.harvest_emu_time_s = clock.emu_time_s
 				rec.harvest_frame = clock.frame
 				rec.harvest_host_ms = host_ms() - exp.started_host_ms
-					if exp.temps.pc then
+					if exp.temps.pc and not exp.watch then
 					rec.pc = "0x" .. (fields[k] or "?")
 					rec.pc_source = "captured at the hit (debugger symbol curpc)"
 				end
@@ -966,41 +1154,51 @@ function exports.startplugin()
 	end
 	local harvest = make_harvest()
 
-	-- partial-installation cleanup: remove every breakpoint THIS attempt installed (by index) and verify
+	-- partial-installation cleanup: remove every breakpoint/watchpoint THIS attempt installed (by index) and verify
 	local function remove_installed(dev, installed)
 		local rows = {}
 		for _, loc in ipairs(installed) do
-			local row = { id = loc.id, address = hex(loc.address), breakpoint_index = loc.bp_index }
-			local ok, e = pcall(function() safe_bpclear(dev, loc.bp_index, loc.ord) end)
-			if not ok then row.error = "bpclear failed: " .. tostring(e) end
-			local ok2, still = pcall(function() return dev.debug:bplist()[loc.bp_index] ~= nil end)
+			local row = loc_row(loc)
+			local what, list_verb = (loc.kind == "wp") and "watchpoint" or "breakpoint", (loc.kind == "wp") and "wplist" or "bplist"
+			local ok, e = pcall(function() safe_clear(dev, loc, loc.ord) end)
+			if not ok then row.error = clear_verb(loc) .. " failed: " .. tostring(e) end
+			local ok2, still = pcall(loc_listed, dev, loc, false)
 			row.cleared = ok2 and not still
-			if not ok2 then row.error = (row.error and (row.error .. "; ") or "") .. "bplist verification failed: " .. tostring(still) end
-			if ok2 and still then row.error = (row.error and (row.error .. "; ") or "") .. "breakpoint still present after bpclear" end
+			if not ok2 then row.error = (row.error and (row.error .. "; ") or "") .. list_verb .. " verification failed: " .. tostring(still) end
+			if ok2 and still then row.error = (row.error and (row.error .. "; ") or "") .. what .. " still present after " .. clear_verb(loc) end
 			rows[#rows + 1] = row
 		end
 		return rows
 	end
 
-	function ops.capture_breakpoint(args)
+	-- Shared start of a breakpoint (watch=false) or watchpoint (watch=true) experiment. Everything after validation - temporaries,
+	-- evidence files, install-all-in-one-callback, verified rollback, orphan registry, harvest, limits, finalize - is common.
+	local function start_experiment(args, watch)
 		local dev, err = find_cpu(args.cpu)
 		if not dev then return nil, err end
 		local left, recovered = resolve_orphans()
 		if #left > 0 then
-			return fail("unresolved_instrumentation", string.format("%d breakpoint(s)/temporary group(s) from an earlier experiment are unresolved; no new capture is accepted until they are gone. %s", #left, RECOVERY),
+			return fail("unresolved_instrumentation", string.format("%d breakpoint(s)/watchpoint(s)/temporary group(s) from an earlier experiment are unresolved; no new capture is accepted until they are gone. %s", #left, RECOVERY),
 				{ remaining_instrumentation = left, recovery = RECOVERY })
 		end
-		local p, perr = build_capture(dev, args)
+		local p, perr
+		if watch then p, perr = build_watch(dev, args) else p, perr = build_capture(dev, args) end
 		if not p then return nil, perr end
 		for i, l in ipairs(p.locs) do l.ord = i end
 
 		-- borrow debugger temporaries: 1 hit counter + 1 per captured register
-		-- (+1 for the hit-time PC in multi-location experiments; the single-address form is unchanged)
-		local picked, aerr, areport = allocate_temps(1 + #p.regs + (p.multi and 1 or 0))
+		-- (+1 for the hit-time PC in multi-location experiments; the single-address form is unchanged;
+		--  watchpoints: +3 for hit-time PC, access address and access data)
+		local picked, aerr, areport = allocate_temps(1 + #p.regs + (watch and 3 or (p.multi and 1 or 0)))
 		if not picked then return nil, aerr end
 		local temps = { counter = picked[1], regs = {} }
 		for i, r in ipairs(p.regs) do temps.regs[r.name] = picked[i + 1] end
-		if p.multi then temps.pc = picked[#p.regs + 2]; temps.regs["(hit-time pc)"] = temps.pc end  -- tracked with the register temps so it is claimed, verified and released with them
+		if watch then
+			temps.pc, temps.addr, temps.data = picked[#p.regs + 2], picked[#p.regs + 3], picked[#p.regs + 4]
+			temps.regs["(hit-time pc)"], temps.regs["(access address)"], temps.regs["(access data)"] = temps.pc, temps.addr, temps.data
+		elseif p.multi then
+			temps.pc = picked[#p.regs + 2]; temps.regs["(hit-time pc)"] = temps.pc  -- tracked with the register temps so it is claimed, verified and released with them
+		end
 
 		exp_counter = exp_counter + 1
 		local id = string.format("exp-%s-%03d", session_id, exp_counter)
@@ -1022,6 +1220,12 @@ function exports.startplugin()
 			conds[#conds + 1] = string.format("((temp%d=%s)|1)", temps.regs[r.name], r.symbol)
 		end
 		if temps.pc then conds[#conds + 1] = string.format("((temp%d=curpc)|1)", temps.pc) end
+		if watch then
+			-- wpaddr = byte-precise logical address of the access; wpdata = the bytes transferred, shifted to the low bits
+			-- (valid for reads and writes). Both exist only while a watchpoint condition is evaluated, hence the temps.
+			conds[#conds + 1] = string.format("((temp%d=wpaddr)|1)", temps.addr)
+			conds[#conds + 1] = string.format("((temp%d=wpdata)|1)", temps.data)
+		end
 		-- ONE counter temp is shared by every location: that is the global event limit and the global sequence.
 		conds[#conds + 1] = string.format("(temp%d<#%d)", temps.counter, p.max_events)
 		local cond = table.concat(conds, "&&")
@@ -1030,13 +1234,17 @@ function exports.startplugin()
 		-- The action differs per location only by its literal id in the format string.
 		local function action_for(loc)
 			local fmt, argv = { "MCP|" .. tag .. "|%d|" .. loc.id }, { string.format("(temp%d=temp%d+1)", temps.counter, temps.counter) }
+			if watch then
+				-- layout: seq|access-literal|address|data|pc|registers...  (the literal id IS the access type of this watchpoint)
+				for _, t in ipairs({ temps.addr, temps.data, temps.pc }) do fmt[#fmt + 1] = "%X"; argv[#argv + 1] = "temp" .. t end
+			end
 			for _, r in ipairs(p.regs) do fmt[#fmt + 1] = "%X"; argv[#argv + 1] = "temp" .. temps.regs[r.name] end
 			for _, mf in ipairs(p.mems) do
 				fmt[#fmt + 1] = "%X"
 				-- '@' = side effects disabled, 'tag.' = explicit device, 'p/d/i' = space, b/w/d = size
 				argv[#argv + 1] = string.format("%s.%s%s@0x%X", args.cpu, mf.letter, MEMOP[mf.size], mf.address)
 			end
-			if temps.pc then fmt[#fmt + 1] = "%X"; argv[#argv + 1] = "temp" .. temps.pc end
+			if temps.pc and not watch then fmt[#fmt + 1] = "%X"; argv[#argv + 1] = "temp" .. temps.pc end
 			return string.format('g;printf "%s",%s', table.concat(fmt, "|"), table.concat(argv, ","))
 		end
 		local loc_by_id = {}
@@ -1047,7 +1255,7 @@ function exports.startplugin()
 
 		local exp = {
 			id = id, epoch = epoch, tag = tag, cpu = args.cpu, locs = p.locs, loc_by_id = loc_by_id, multi = p.multi, max_events = p.max_events, max_wall = p.max_wall,
-			regs = p.regs, mems = p.mems, label = p.label, temps = temps,
+			regs = p.regs, mems = p.mems, label = p.label, temps = temps, watch = watch or nil,
 			state = "running", started_host_ms = host_ms(), last_seq = 0, captured = 0, dropped = 0,
 			cl_n = -1, cl_last = nil, errors = {}, evidence_errors = {}, recent = {}, transitions = {},
 			events_file = ef, harvest = harvest, dir = dir, manifest_path = dir .. "/manifest.json",
@@ -1056,7 +1264,10 @@ function exports.startplugin()
 		local treg = {}
 		for name, t in pairs(temps.regs) do treg[name] = "temp" .. t end
 		local locparams = {}
-		for _, loc in ipairs(p.locs) do locparams[#locparams + 1] = { id = loc.id, address = hex(loc.address) } end
+		for _, loc in ipairs(p.locs) do
+			locparams[#locparams + 1] = watch and { id = loc.id, access = loc.access, address = hex(loc.address), length = loc.length, last_address = hex(loc.last) }
+				or { id = loc.id, address = hex(loc.address) }
+		end
 		local mparams = {}
 		for _, mf in ipairs(p.mems) do mparams[#mparams + 1] = { space = mf.space, address = hex(mf.address), size = mf.size } end
 		local rnames = {}
@@ -1064,25 +1275,36 @@ function exports.startplugin()
 		exp.manifest = {
 			manifest_version = 2, status = "running",
 			experiment_id = id, label = p.label, session_id = session_id,
-			parameters = { cpu = args.cpu, locations = locparams, location_form = p.multi and "locations" or "address (single, legacy)",
+			parameters = { cpu = args.cpu, locations = locparams, location_form = watch and "watchpoint range (one watchpoint per access type)" or (p.multi and "locations" or "address (single, legacy)"),
 				address = (not p.multi) and hex(p.locs[1].address) or nil, registers = rnames, memory = mparams,
-				max_events = p.max_events, max_wall_seconds = p.max_wall },
+				max_events = p.max_events, max_wall_seconds = p.max_wall,
+				watch = watch and { space = p.space, address = hex(p.start), length = p.length, last_address = hex(p.last), access = p.access } or nil },
 			mame_version = emu.app_version(), bridge_version = BRIDGE_VERSION, protocol_version = PROTOCOL_VERSION,
 			machine = { name = machine().system.name, description = machine().system.description },
 			cpu_context = { tag = args.cpu, name = try(function() return dev.name end), address_spaces = list_spaces(dev) },
-			bank_context = { per_event = "unavailable",
+			bank_context = watch and { per_event = "unavailable",
+				reason = "events carry the LOGICAL address the CPU issued. Which bank was selected at the hit cannot be sampled at hit time (the debugger expression language has no bank-entry operator and Lua only runs at harvest time), so no event is attributed to a bank. Whether this range is banked at all is a property of the address map (disassemble_memory / the memory map report mapping context), not of an event.",
+				address_semantics = "logical CPU-visible address in the watched address space; mirrors of the same storage are distinct addresses" }
+				or { per_event = "unavailable",
 				reason = "memory fields are read at the hit by the breakpoint action (hit-time, in the selected bank), but the debugger expression language has no bank-entry operator and Lua only runs at harvest time; a bank id sampled then would not describe the hit",
 				memory_fields_semantics = "logical CPU-visible address; value is whatever the currently selected bank mapped there at the hit" },
 			starting_state = { execution = exec_state(), clock = emu_clock(),
 				description = "state at the moment the experiment was installed; no savestate was loaded" },
 			interventions = { inputs = {}, patches = {}, savestate_loads = {},
-				notes = "none by this bridge. The breakpoint action issues 'g' after each recorded hit; installing, cancelling or finishing a capture never starts, pauses or stops emulation by itself." },
-			instrumentation = { { kind = "breakpoints", cpu = args.cpu, condition = cond, locations = {},
+				notes = "none by this bridge. The " .. (watch and "watchpoint" or "breakpoint") .. " action issues 'g' after each recorded hit; installing, cancelling or finishing a capture never starts, pauses or stops emulation by itself." },
+			instrumentation = { { kind = watch and "watchpoints" or "breakpoints", cpu = args.cpu, condition = cond, locations = {},
 				debugger_temporaries = { counter = "temp" .. temps.counter, registers = treg,
-					ownership = "borrowed from the shared global temp0..temp9; chosen because value was 0 and unreferenced by any breakpoint; ONE counter and one register set are shared by all locations (no per-location temps); reset to 0 at release if the counter shows no interference",
+					ownership = "borrowed from the shared global temp0..temp9; chosen because value was 0 and unreferenced by any breakpoint or watchpoint; ONE counter and one register set are shared by all locations (no per-location temps); reset to 0 at release if the counter shows no interference",
 					selection_report = areport },
 				global_limit = "one hit counter shared by every location's condition enforces max_events across the experiment; its value is the global event sequence" } },
-			event_semantics = { location = "id of the breakpoint that fired", address = "logical breakpoint address of that location (not a ROM offset)",
+			event_semantics = watch and {
+				location = "'read' or 'write': the access type of the watchpoint that fired, a literal baked into that watchpoint (MAME's expression language cannot report it)",
+				access = "same as location",
+				address = "byte-precise LOGICAL address of the access in the watched space (debugger symbol wpaddr); address units are bytes (address shift 0 is required); not a ROM offset and not bank-qualified",
+				data = "the value transferred by this access, shifted to the low bits (debugger symbol wpdata); reads report the value read. MAME does NOT report the access width: a small value may be a byte access or a wider access carrying a small value, so width and byte lanes are not recorded.",
+				pc = "address of the instruction executing at the hit (debugger symbol curpc, not the prefetch-adjusted pc)",
+				registers = "values at the hit, read in the watchpoint condition (after the access was decoded)" }
+				or { location = "id of the breakpoint that fired", address = "logical breakpoint address of that location (not a ROM offset)",
 				pc = p.multi and "hit-time PC captured at the hit (curpc)" or "breakpoint address by construction (single legacy form)" },
 			resumes_automatically = "after each recorded hit only (action 'g'); not at install, cancel or completion",
 			limits = { max_events = p.max_events, max_wall_seconds = p.max_wall },
@@ -1096,35 +1318,43 @@ function exports.startplugin()
 		-- be seen at location 1 before location 2 exists, and no temporary stop is needed even when MAME is running.
 		-- Optional bpset args MUST be passed: bpset(addr) alone crashes MAME 0.289.
 		local installed, outcomes, failure = {}, {}, nil
+		local what = watch and "watchpoint" or "breakpoint"
 		for i, loc in ipairs(p.locs) do
 			local ok, res = pcall(function()
 				if cfg.test_fail_install_at == i then error("injected test failure at location " .. i) end
+				if watch then return dev.debug:wpset(dev.spaces[loc.space], loc.wptype, loc.address, loc.length, cond, loc.action) end
 				return dev.debug:bpset(loc.address, cond, loc.action)
 			end)
-			local row = { id = loc.id, address = hex(loc.address), armed = false }
+			local row = loc_row(loc)
+			row.armed = false
 			outcomes[#outcomes + 1] = row
 			if ok then
-				-- verify it really is in the CPU's breakpoint list at that address
-				local okv, present = pcall(function() local b = dev.debug:bplist()[res]; return b ~= nil and b.address == loc.address end)
+				if watch then wp_touched[args.cpu .. "/" .. loc.space] = true end  -- the per-space table exists now: wplist is safe here
+				-- verify it really is in the CPU's breakpoint/watchpoint list at that address
+				local okv, present = pcall(function()
+					local b
+					if watch then b = dev.debug:wplist(dev.spaces[loc.space])[res] else b = dev.debug:bplist()[res] end
+					return b ~= nil and b.address == loc.address
+				end)
+				loc.bp_index = res
+				installed[#installed + 1] = loc  -- exists somewhere: if it fails verification it is removed with the rest
 				if okv and present then
-					loc.bp_index = res
-					row.armed, row.breakpoint_index = true, res
-					installed[#installed + 1] = loc
+					row.armed, row[index_key(loc)] = true, res
 				else
-					loc.bp_index = res
-					installed[#installed + 1] = loc  -- exists somewhere: remove it with the rest
-					row.error = "breakpoint was created but is not in the breakpoint list at the requested address"
+					row.error = what .. " was created but is not in the " .. what .. " list at the requested address"
 					failure = row.error
 					break
 				end
 			else
 				row.error = tostring(res)
-				failure = "bpset failed for location " .. loc.id .. ": " .. tostring(res)
+				failure = (watch and "wpset" or "bpset") .. " failed for location " .. loc.id .. ": " .. tostring(res)
 				break
 			end
 		end
 		for i = #outcomes + 1, #p.locs do
-			outcomes[i] = { id = p.locs[i].id, address = hex(p.locs[i].address), armed = false, not_attempted = true }
+			local row = loc_row(p.locs[i])
+			row.armed, row.not_attempted = false, true
+			outcomes[i] = row
 		end
 		if failure then
 			local cleanup_rows = remove_installed(dev, installed)
@@ -1135,7 +1365,10 @@ function exports.startplugin()
 				local left, tl = {}, { temps.counter }
 				for _, t in pairs(temps.regs) do tl[#tl + 1] = t end
 				for i, r in ipairs(cleanup_rows) do
-					if not r.cleared then left[#left + 1] = { id = r.id, address = installed[i].address, bp_index = installed[i].bp_index, ord = installed[i].ord } end
+					if not r.cleared then
+						local l = installed[i]
+						left[#left + 1] = { id = r.id, address = l.address, bp_index = l.bp_index, ord = l.ord, kind = l.kind, space = l.space, length = l.length, access = l.access }
+					end
 				end
 				orphans[#orphans + 1] = { exp_id = id, cpu = args.cpu, source = "install_rollback", locs = left, temps = tl }
 				for _, t in ipairs(tl) do claimed_temps[t] = id end
@@ -1146,13 +1379,14 @@ function exports.startplugin()
 			exp.manifest.installation = { all_armed = false, locations = outcomes, rollback = { all_removed = cleanup_ok, removed = cleanup_rows } }
 			exp.manifest.counts = { events_captured = 0, hits_observed = 0, events_dropped = 0 }
 			write_manifest(exp)
-			return fail("install_failed", failure .. (cleanup_ok and "; every breakpoint installed by this attempt was removed and verified"
-				or "; CLEANUP FAILED: some breakpoints installed by this attempt could not be removed (see detail.rollback)"),
+			return fail("install_failed", failure .. (cleanup_ok and "; every " .. what .. " installed by this attempt was removed and verified"
+				or "; CLEANUP FAILED: some " .. what .. "s installed by this attempt could not be removed (see detail.rollback)"),
 				{ evidence = dir, installation = outcomes, rollback = { all_removed = cleanup_ok, removed = cleanup_rows, recovery = (not cleanup_ok) and RECOVERY or nil } })
 		end
 		for _, loc in ipairs(p.locs) do
-			exp.manifest.instrumentation[1].locations[#exp.manifest.instrumentation[1].locations + 1] = {
-				id = loc.id, address = hex(loc.address), breakpoint_index = loc.bp_index, action = loc.action }
+			local row = loc_row(loc)
+			row.action = loc.action
+			exp.manifest.instrumentation[1].locations[#exp.manifest.instrumentation[1].locations + 1] = row
 		end
 		exp.manifest.installation = { all_armed = true, locations = outcomes,
 			note = "all locations installed in one plugin callback before emulation could run again" }
@@ -1168,14 +1402,18 @@ function exports.startplugin()
 		return {
 			experiment_id = id, state = "running", asynchronous = true,
 			breakpoint_index = (not p.multi) and p.locs[1].bp_index or nil, evidence_dir = dir,
-			locations = outcomes, all_armed = true, location_limit = LIMITS.max_locations,
+			locations = outcomes, all_armed = true, location_limit = (not watch) and LIMITS.max_locations or nil,
+			watch = watch and { space = p.space, address = hex(p.start), length = p.length, last_address = hex(p.last), access = p.access } or nil,
 			recovered_instrumentation = (#recovered > 0) and recovered or nil,
 			debugger_temporaries = { counter = "temp" .. temps.counter, registers = treg },
-			execution_policy = "capture_breakpoint does not change execution state. If MAME is paused or debugger-stopped now, the capture is armed but records nothing until emulation is resumed (execution_control resume).",
-			note = "poll experiment_status; the breakpoint action resumes execution after each recorded hit",
+			execution_policy = (watch and "capture_watchpoint" or "capture_breakpoint") .. " does not change execution state. If MAME is paused or debugger-stopped now, the capture is armed but records nothing until emulation is resumed (execution_control resume).",
+			note = "poll experiment_status; the " .. what .. " action resumes execution after each recorded hit",
 			execution = exec_state(),
 		}
 	end
+
+	function ops.capture_breakpoint(args) return start_experiment(args, false) end
+	function ops.capture_watchpoint(args) return start_experiment(args, true) end
 
 	-- Per-location view. "armed" = the breakpoint was installed and verified; hits = events captured at it. armed with
 	-- hits = 0 means "no hits observed"; armed = false would mean it was never successfully armed. Events dropped from the
@@ -1183,8 +1421,9 @@ function exports.startplugin()
 	local function locs_status(exp)
 		local out = {}
 		for _, loc in ipairs(exp.locs) do
-			out[#out + 1] = { id = loc.id, address = hex(loc.address), armed = loc.bp_index ~= nil, breakpoint_index = loc.bp_index,
-				events_captured = loc.captured, no_hits_observed = (loc.captured == 0) }
+			local row = loc_row(loc)
+			row.armed, row.events_captured, row.no_hits_observed = loc.bp_index ~= nil, loc.captured, (loc.captured == 0)
+			out[#out + 1] = row
 		end
 		return out
 	end
@@ -1312,8 +1551,8 @@ function exports.startplugin()
 	---------------------------------------------------------------------------
 	-- Frames are counted from the frame_done notifier, which MAME fires once per emulated frame and not while emulation is
 	-- paused or stopped in the debugger. A press set at frame F is visible to the machine from frame F+1 and is released when
-	-- the Nth frame after arming has completed, so the machine sees it for exactly N frames (verified in
-	-- docs/VALIDATION.md). While emulation is stopped nothing elapses: the press stays held until emulation has run N frames
+	-- the Nth frame after arming has completed, so the machine sees it for exactly N frames (verified against an
+	-- independent per-frame port watcher). While emulation is stopped nothing elapses: the press stays held until emulation has run N frames
 	-- or the press is cancelled. The bridge never holds an input without a frame bound, and it releases on cancel, client
 	-- disconnect, machine stop and server stop.
 	local INPUT_CLASSES = { controller = true, misc = true }
@@ -1389,12 +1628,67 @@ function exports.startplugin()
 		return false
 	end
 
+	-- Per-step requested vs OBSERVED timing of a sequence. Observations are this bridge's own reads of the machine's port at the end
+	-- of every emulated frame (is the field's bit different from its idle baseline?). They are not an independent observer.
+	local function sequence_report(rec)
+		local steps, deviations, outside = {}, {}, {}
+		local elapsed = rec.elapsed
+		local windows = {}  -- per field: list of {start, stop}
+		for _, st in ipairs(rec.schedule) do
+			windows[st.entry] = windows[st.entry] or {}
+			table.insert(windows[st.entry], st)
+		end
+		for _, st in ipairs(rec.schedule) do
+			local obs = st.entry.observed
+			local reached = math.min(st.stop, elapsed)
+			local inwin, first, last = 0, nil, nil
+			for j = st.start, reached - 1 do
+				if obs[j] then inwin = inwin + 1; first = first or j; last = j end
+			end
+			local completed = math.max(0, reached - st.start)
+			local row = {
+				step = st.index - 1, port = st.entry.port, field = st.entry.name, start = st.start, frames = st.frames, end_offset = st.stop, state = st.state,
+				window_frames_completed = completed, observed_pressed_in_window = inwin, first_observed_offset = first, last_observed_offset = last,
+			}
+			if completed > 0 then
+				local exact = (inwin == completed) and (first == st.start) and (last == st.start + completed - 1)
+				row.matches_schedule = exact
+				if not exact then
+					deviations[#deviations + 1] = string.format("step %d (%s/%s): scheduled frames %d..%d, observed pressed on %d of %d completed window frames (first observed offset %s, last %s)",
+						st.index - 1, st.entry.port, st.entry.name, st.start, st.stop - 1, inwin, completed, tostring(first), tostring(last))
+				end
+			end
+			steps[#steps + 1] = row
+		end
+		for _, e in ipairs(rec.fields) do
+			local extra = 0
+			for j = 0, elapsed - 1 do
+				if e.observed[j] then
+					local inside = false
+					for _, st in ipairs(windows[e] or {}) do if j >= st.start and j < st.stop then inside = true break end end
+					if not inside then extra = extra + 1 end
+				end
+			end
+			if extra > 0 then
+				outside[#outside + 1] = { port = e.port, field = e.name, frames = extra }
+				deviations[#deviations + 1] = string.format("%s/%s read pressed on %d frame(s) outside every scheduled window", e.port, e.name, extra)
+			end
+		end
+		return {
+			steps = steps, transitions = rec.transitions_total, transitions_applied = rec.transitions_applied,
+			duration_frames = rec.frames, frames_completed = elapsed,
+			origin = { anchored_on_observed_press = rec.anchored, latency_frames_not_counted = rec.latency_frames, origin_machine_frame = rec.origin_frame },
+			deviations = deviations, pressed_outside_windows = outside,
+			timing_basis = "observed by this bridge reading each field's port bit at the end of every emulated frame; it is not an independent observer, and a bit shared with another active input would hide a missing press",
+		}
+	end
+
 	input_summary = function()
 		local rec = input_active or input_last
 		if not rec then return { state = "none" } end
 		local fields = {}
 		for _, e in ipairs(rec.fields) do fields[#fields + 1] = { port = e.port, field = e.name } end
-		return {
+		local s = {
 			state = rec.state, input_id = rec.id, inputs = fields, frames_requested = rec.frames, frames_elapsed = rec.elapsed, latency_frames = rec.latency_frames,
 			armed_at_frame = rec.arm_frame, ended_at_frame = rec.ended_frame, end_reason = rec.end_reason,
 			frames_observed_pressed = rec.observed_frames, release_errors = rec.release_errors,
@@ -1402,6 +1696,11 @@ function exports.startplugin()
 			waiting_for_emulation = (rec.state == "holding" and execution_stopped()) or nil,
 			execution = exec_state(),
 		}
+		if rec.schedule then
+			s.kind = "sequence"
+			s.sequence = sequence_report(rec)
+		end
+		return s
 	end
 
 	release_inputs = function(reason)
@@ -1413,9 +1712,33 @@ function exports.startplugin()
 			if not ok then errs[#errs + 1] = e.port .. "/" .. e.name .. ": " .. tostring(err) end
 		end
 		rec.state = (reason == "completed") and "released" or "cancelled"
+		if rec.schedule then   -- steps cut short by cancel/disconnect/stop/error say so instead of staying 'pressed'/'pending'
+			for _, st in ipairs(rec.schedule) do
+				if st.state == "pressed" then st.state = "released_early" elseif st.state == "pending" then st.state = "not_started" end
+			end
+		end
 		rec.end_reason, rec.release_errors, rec.ended_frame = reason, errs, frame_now()
 		input_last, input_active = rec, nil
 		return rec
+	end
+
+	-- One {port, field} reference -> a pressable, supported DIGITAL field entry, or nil + a typed error (shared by press and sequence).
+	local function resolve_input(ports, item, label)
+		if type(item) ~= "table" or type(item.port) ~= "string" or type(item.field) ~= "string" then
+			return fail("bad_argument", label .. " must be an object with string 'port' and 'field'")
+		end
+		local port = ports[item.port]
+		if not port then return fail("unknown_port", "this machine has no input port " .. item.port .. "; call list_inputs") end
+		local f = port.fields[item.field]
+		if not f then
+			return fail("unknown_field", "port " .. item.port .. " has no input field '" .. item.field .. "'; call list_inputs",
+				{ fields = sorted_keys(port.fields) })
+		end
+		local info = field_info(item.port, item.field, f)
+		if not info.supported then
+			return fail("unsupported_input", item.port .. "/" .. item.field .. ": " .. info.unsupported_reason, { input = info })
+		end
+		return { port = item.port, name = item.field, field = f, mask = info.mask }
 	end
 
 	function ops.input_press(args)
@@ -1436,24 +1759,12 @@ function exports.startplugin()
 		local ports = machine().ioport.ports
 		local fields, seen, baseline = {}, {}, {}
 		for i, item in ipairs(raw) do
-			if type(item) ~= "table" or type(item.port) ~= "string" or type(item.field) ~= "string" then
-				return fail("bad_argument", "inputs[" .. (i - 1) .. "] must be an object with string 'port' and 'field'")
-			end
-			local port = ports[item.port]
-			if not port then return fail("unknown_port", "this machine has no input port " .. item.port .. "; call list_inputs") end
-			local f = port.fields[item.field]
-			if not f then
-				return fail("unknown_field", "port " .. item.port .. " has no input field '" .. item.field .. "'; call list_inputs",
-					{ fields = sorted_keys(port.fields) })
-			end
+			local entry, ierr = resolve_input(ports, item, "inputs[" .. (i - 1) .. "]")
+			if not entry then return nil, ierr end
 			local key = item.port .. "\0" .. item.field
 			if seen[key] then return fail("bad_argument", "duplicate input " .. item.port .. "/" .. item.field) end
 			seen[key] = true
-			local info = field_info(item.port, item.field, f)
-			if not info.supported then
-				return fail("unsupported_input", item.port .. "/" .. item.field .. ": " .. info.unsupported_reason, { input = info })
-			end
-			fields[#fields + 1] = { port = item.port, name = item.field, field = f, mask = info.mask }
+			fields[#fields + 1] = entry
 			baseline[item.port] = port_value(item.port)
 		end
 		local armed = {}
@@ -1480,6 +1791,115 @@ function exports.startplugin()
 		return s
 	end
 
+	-- input_sequence: a validated schedule of {port, field, start, frames} steps, executed in EMULATED frames.
+	--   * origin: offset 0 is the first emulated frame in which the machine reads the offset-0 step(s) pressed (the same anchoring as
+	--     input_press: up to LIMITS.input_latency_frames idle frames after an arm made while stopped are not counted). The earliest
+	--     step must therefore start at offset 0.
+	--   * a step holds its field for exactly `frames` frames from offset `start`: transitions are applied inside the frame-done
+	--     notifier, between emulated frames, so the machine sees a press from the frame that begins at `start`.
+	--   * same boundary: every release is applied before every press, each in schedule order; both happen between two frames, so the
+	--     machine cannot see an order within one boundary.
+	--   * overlap: different fields may overlap freely (chords); two steps of ONE field must leave at least one idle frame between them.
+	--   * stopped/paused: arming is allowed; only the offset-0 presses are set, nothing elapses until emulation runs, and nothing is
+	--     resumed by this call. cancel / disconnect / machine stop / MAME shutdown release everything through release_inputs().
+	function ops.input_sequence(args)
+		if stopping then return fail("machine_stopping", "MAME is shutting down") end
+		if input_active then
+			return fail("input_active", "inputs are already being held (" .. input_active.id .. "); wait for them to finish or call input_cancel", { input = input_summary() })
+		end
+		if ckpt_pending then return fail("checkpoint_busy", "a checkpoint operation is unfinished; poll checkpoint_status") end
+		local raw = args.steps
+		if type(raw) ~= "table" or #raw < 1 or #raw > LIMITS.max_sequence_steps then
+			return fail("bad_argument", "steps must be a list of 1.." .. LIMITS.max_sequence_steps .. " {port, field, start, frames} objects")
+		end
+		local ports = machine().ioport.ports
+		local fields, by_key, steps, baseline = {}, {}, {}, {}
+		local total = 0
+		for i, item in ipairs(raw) do
+			local label = "steps[" .. (i - 1) .. "]"
+			local entry, ierr = resolve_input(ports, item, label)
+			if not entry then return nil, ierr end
+			local start, e1 = parse_uint(item.start, label .. ".start")
+			if not start then return nil, e1 end
+			local dur, e2 = parse_uint(item.frames, label .. ".frames")
+			if not dur then return nil, e2 end
+			if dur < 1 or dur > LIMITS.max_input_frames then
+				return fail("bad_argument", label .. ".frames must be 1.." .. LIMITS.max_input_frames .. " (emulated frames)")
+			end
+			if start + dur > LIMITS.max_sequence_frames then
+				return fail("too_large", string.format("%s ends at frame offset %d; a sequence may span at most %d emulated frames", label, start + dur, LIMITS.max_sequence_frames))
+			end
+			local key = item.port .. "\0" .. item.field
+			local e = by_key[key]
+			if not e then
+				if #fields >= LIMITS.max_sequence_fields then
+					return fail("too_large", "a sequence may use at most " .. LIMITS.max_sequence_fields .. " distinct fields")
+				end
+				e = entry
+				e.observed = {}
+				by_key[key] = e
+				fields[#fields + 1] = e
+				baseline[item.port] = port_value(item.port)
+			end
+			steps[#steps + 1] = { index = i, entry = e, start = start, frames = dur, stop = start + dur, state = "pending" }
+			if start + dur > total then total = start + dur end
+		end
+		-- whole-sequence validation, before anything is pressed
+		local earliest = steps[1].start
+		for _, st in ipairs(steps) do if st.start < earliest then earliest = st.start end end
+		if earliest ~= 0 then
+			return fail("bad_argument", "the earliest step must start at frame offset 0: offsets are relative to the first observed press, so a sequence cannot begin with idle frames")
+		end
+		for a = 1, #steps do
+			for b = a + 1, #steps do
+				local x, y = steps[a], steps[b]
+				if x.entry == y.entry then
+					local lo, hi = x, y
+					if y.start < x.start then lo, hi = y, x end
+					if hi.start <= lo.stop then  -- overlapping, or abutting with no idle frame between the two presses
+						return fail("bad_argument", string.format("steps %d and %d press %s/%s with overlapping or touching windows (%d..%d and %d..%d); leave at least one idle frame between two presses of one field",
+							lo.index - 1, hi.index - 1, x.entry.port, x.entry.name, lo.start, lo.stop - 1, hi.start, hi.stop - 1))
+					end
+				end
+			end
+		end
+		local peak = 0
+		for _, st in ipairs(steps) do
+			local n = 0
+			for _, o in ipairs(steps) do if o.start <= st.start and st.start < o.stop then n = n + 1 end end
+			if n > peak then peak = n end
+		end
+		if peak > LIMITS.max_input_fields then
+			return fail("too_large", string.format("%d fields would be held at the same time; at most %d may be held at once", peak, LIMITS.max_input_fields))
+		end
+		table.sort(steps, function(p, q) if p.start ~= q.start then return p.start < q.start end return p.index < q.index end)
+		local f0 = frame_now()
+		if not f0 then return fail("unsupported_machine", "this machine has no screen, so emulated frames cannot be counted; inputs are refused") end
+		-- arm: press the offset-0 steps (all or nothing)
+		local armed, anchor = {}, {}
+		for _, st in ipairs(steps) do
+			if st.start == 0 then
+				local ok, err = pcall(function() st.entry.field:set_value(1) end)
+				if not ok then
+					for _, a in ipairs(armed) do pcall(function() a.entry.field:set_value(0) end) end
+					return fail("input_failed", "could not press " .. st.entry.port .. "/" .. st.entry.name .. ": " .. tostring(err) .. "; everything pressed by this call was released")
+				end
+				st.state = "pressed"
+				armed[#armed + 1] = st
+				anchor[#anchor + 1] = st.entry
+			end
+		end
+		input_counter = input_counter + 1
+		input_active = {
+			id = string.format("inp-%s-%03d", session_id, input_counter), kind = "sequence", fields = fields, schedule = steps, anchor_fields = anchor,
+			frames = total, baseline = baseline, arm_frame = f0, last_frame = f0, elapsed = 0, observed_frames = 0, latency_frames = 0, started = false,
+			state = "holding", release_errors = {}, transitions_total = #steps * 2, transitions_applied = #armed,
+		}
+		local s = input_summary()
+		s.semantics = "frame offset 0 = the first emulated frame in which the machine reads the offset-0 press(es); a step holds its field for exactly `frames` emulated frames from `start`; at one boundary releases are applied before presses; same-field steps need an idle frame between them. Nothing elapses while emulation is paused or stopped, and this call never resumes it."
+		return s
+	end
+
 	function ops.input_status(args)
 		return input_summary()
 	end
@@ -1492,11 +1912,58 @@ function exports.startplugin()
 		return s
 	end
 
+	local function field_pressed(e, baseline)  -- does this one field's bit differ from its idle baseline?
+		local v = port_value(e.port)
+		local base = baseline[e.port]
+		return v ~= nil and base ~= nil and e.mask ~= nil and ((v ~ base) & e.mask) ~= 0
+	end
+
+	-- One completed emulated frame of a sequence: observe, then apply the transitions of the boundary that follows.
+	local function sequence_frame(rec)
+		if not rec.started then
+			local anchored = false
+			for _, e in ipairs(rec.anchor_fields) do if field_pressed(e, rec.baseline) then anchored = true end end
+			if not anchored and rec.latency_frames < LIMITS.input_latency_frames then
+				rec.latency_frames = rec.latency_frames + 1   -- frame(s) the machine read idle after a stopped arm: not counted
+				return
+			end
+			rec.started, rec.anchored, rec.origin_frame = true, anchored, frame_now()
+		end
+		local j = rec.elapsed          -- offset of the frame that just completed
+		local any = false
+		for _, e in ipairs(rec.fields) do
+			if field_pressed(e, rec.baseline) then e.observed[j] = true; any = true end
+		end
+		if any then rec.observed_frames = rec.observed_frames + 1 end
+		rec.elapsed = j + 1
+		local boundary = rec.elapsed
+		for _, st in ipairs(rec.schedule) do   -- releases first
+			if st.state == "pressed" and st.stop == boundary then
+				local ok, err = pcall(function() st.entry.field:set_value(0) end)
+				if not ok then release_inputs("error: could not release " .. st.entry.port .. "/" .. st.entry.name .. ": " .. tostring(err)) return end
+				st.state = "released"
+				rec.transitions_applied = rec.transitions_applied + 1
+			end
+		end
+		for _, st in ipairs(rec.schedule) do   -- then presses
+			if st.state == "pending" and st.start == boundary then
+				local ok, err = pcall(function() st.entry.field:set_value(1) end)
+				if not ok then release_inputs("error: could not press " .. st.entry.port .. "/" .. st.entry.name .. ": " .. tostring(err)) return end
+				st.state = "pressed"
+				rec.transitions_applied = rec.transitions_applied + 1
+			end
+		end
+		if boundary >= rec.frames then release_inputs("completed") end
+	end
+
 	emu.register_frame_done(function()
 		local f = frame_now()
 		if not f then return end
 		local rec = input_active
-		if rec and f > rec.last_frame then
+		if rec and rec.schedule and f > rec.last_frame then
+			rec.last_frame = f
+			sequence_frame(rec)
+		elseif rec and f > rec.last_frame then
 			rec.last_frame = f
 			local pressed = pressed_now(rec)
 			if not rec.started and not pressed and rec.latency_frames < LIMITS.input_latency_frames then
@@ -1624,6 +2091,222 @@ function exports.startplugin()
 				rolled_back and "restored" or "NOT restored (inspect the address)"), out)
 		end
 		return out
+	end
+
+	---------------------------------------------------------------------------
+	-- disassemble: typed disassembly of one CPU's current instruction view
+	---------------------------------------------------------------------------
+	-- MAME 0.289 exposes no Lua disassembler. The only supported route is the debugger's own `dasm` command, which this bridge
+	-- assembles from validated values ONLY (a quoted plugin-owned file path, two integers, and an existing device tag), writes to
+	-- an evidence-directory file and parses back. `dasm` disassembles through the CPU's opcode reads (the decrypted `opcodes`
+	-- space when the machine defines one, otherwise the program space); there is no option to choose another view, so the view
+	-- used is reported rather than selected.
+	local dasm_counter = 0
+
+	-- Which entries of the DECLARED address map cover [first, last] of one space, and, for bank handlers, which memory bank each
+	-- is and which entry is selected right now. A handler installed later at run time is not visible in the declared map.
+	local function resolve_bank(dev, rel)
+		if type(rel) ~= "string" or rel == "" then return nil, "the map entry names no bank tag" end
+		local banks = machine().memory.banks
+		local cands = { rel, ":" .. rel }
+		local owner = opt(function() return dev.owner end)
+		local otag = owner and opt(function() return owner.tag end)
+		if type(otag) == "string" and otag ~= "" and otag ~= ":" then cands[#cands + 1] = otag .. ":" .. rel end
+		local seen, hits = {}, {}
+		for _, c in ipairs(cands) do
+			if not seen[c] and banks[c] then seen[c] = true; hits[#hits + 1] = c end
+		end
+		if #hits == 1 then return hits[1] end
+		if #hits == 0 then return nil, "no memory bank with that tag exists" end
+		return nil, "the relative tag matches more than one bank: " .. table.concat(hits, ", ")
+	end
+
+	local function map_context(dev, sp, first, last, space_name)
+		local ctx = { space = space_name, first = hex(first), last = hex(last), runs = {}, banked = false, source = "declared address map (MAME's address_map description of this space)" }
+		local ok, entries = pcall(function() return sp.map.entries end)
+		if not ok or entries == nil then
+			ctx.available = false
+			ctx.reason = "the address map of this space is not available"
+			return ctx
+		end
+		ctx.available = true
+		local prev, run
+		local max_runs = 16
+		for a = first, last do
+			local e = map_entry_for(sp, a)
+			if run and e == prev then
+				run.last = a
+			else
+				if #ctx.runs >= max_runs then ctx.truncated = true break end
+				prev = e
+				run = { first = a, last = a, entry = e }
+				ctx.runs[#ctx.runs + 1] = run
+			end
+		end
+		for i, r in ipairs(ctx.runs) do
+			local e = r.entry
+			local row = { first = hex(r.first), last = hex(r.last) }
+			if not e then
+				row.read_handler, row.note = "unmapped", "no address-map entry covers these addresses"
+			else
+				row.read_handler, row.write_handler = e.read.handlertype, e.write.handlertype
+				row.entry_start, row.entry_end, row.entry_mirror = hex(e.address_start), hex(e.address_end), hex(e.address_mirror or 0)
+				-- instruction fetches are reads; a write-side bank is reported too because it can differ (e.g. RAM banks)
+				for _, side in ipairs({ { "bank", e.read }, { "write_bank", e.write } }) do
+					if side[2].handlertype == "bank" then
+						local rel = side[2].tag
+						ctx.banked = true
+						local bank = { tag_in_map = rel }
+						local resolved, why = resolve_bank(dev, rel)
+						if resolved then
+							bank.tag = resolved
+							bank.selected_entry = opt(function() return machine().memory.banks[resolved].entry end)
+						else
+							bank.unresolved = why
+						end
+						row[side[1]] = bank
+					end
+				end
+			end
+			ctx.runs[i] = row
+		end
+		if ctx.banked then
+			ctx.bank_note = "bank handlers back part of this range. The bytes and text returned describe the bank entry selected at this instant (bank.selected_entry); a different entry maps different bytes at the same logical addresses, and nothing here says which entry holds any other code."
+		end
+		return ctx
+	end
+
+	function ops.disassemble(args)
+		local dev, err = find_cpu(args.cpu)
+		if not dev then return nil, err end
+		if not args.cpu:match("^[%w_:%.%-]+$") then return fail("bad_argument", "cpu tag contains characters that cannot be passed to the disassembler") end
+		local dbg = machine().debugger
+		if not dbg then return fail("debugger_unavailable", "MAME was started without -debug; disassembly needs the debugger") end
+		local dbgi, dberr = iface(dev, "debug")
+		if dberr then return fail("debug_interface_error", args.cpu .. ": reading its debug interface failed: " .. dberr) end
+		if not dbgi then return fail("no_debug_interface", args.cpu .. " has no debug interface, so it has no disassembler (it is not an executing CPU); use read_memory for its address spaces") end
+		local sp = dev.spaces["program"]
+		if not sp then return fail("unknown_space", "cpu " .. args.cpu .. " has no program space") end
+		if sp.shift ~= 0 then
+			return fail("unsupported_space", string.format("%s/program has address shift %d (address units are not bytes); disassembly of it is not supported", args.cpu, sp.shift))
+		end
+		local start, e1 = parse_uint(args.address, "address")
+		if not start then return nil, e1 end
+		local count, e2 = parse_uint(args.count, "count")
+		if not count then return nil, e2 end
+		if count < 1 or count > LIMITS.max_disasm_instructions then
+			return fail("bad_argument", "count must be 1.." .. LIMITS.max_disasm_instructions .. " instructions")
+		end
+		if start > sp.address_mask then
+			return fail("out_of_range", string.format("address %s exceeds the address mask %s of %s/program", hex(start), hex(sp.address_mask), args.cpu))
+		end
+		if not execution_stopped() then
+			return fail("execution_running", "disassemble requires paused or debugger-stopped execution (execution_control pause): the code view is only stable while nothing runs, and banked or self-modifying code can change between calls")
+		end
+		-- one extra instruction is requested only to learn the length of the last one returned
+		local maxb = LIMITS.max_disasm_bytes_per_instruction
+		local req_len = math.min((count + 1) * maxb, sp.address_mask - start + 1)
+		dasm_counter = dasm_counter + 1
+		local dir = cfg.evidence_dir .. "/disasm"
+		if not mkdir_p(dir) then return fail("evidence_unavailable", "cannot create " .. dir) end
+		local path = string.format("%s/dasm-%s-%d.txt", dir, session_id, dasm_counter)
+		os.remove(path)
+		local cl = dbg.consolelog
+		local before = #cl
+		local okc, cerr = pcall(function() dbg:command(string.format('dasm "%s",0x%X,0x%X,0,%s', path, start, req_len, args.cpu)) end)
+		local messages = {}
+		for i = before + 1, #cl do messages[#messages + 1] = cl[i] end
+		local f = io.open(path, "r")
+		if not okc or not f then
+			if f then f:close() end
+			pcall(os.remove, path)
+			return fail("disassembly_failed", string.format("MAME's disassembler produced no output for %s at %s%s", args.cpu, hex(start),
+				(not okc) and (": " .. tostring(cerr)) or (#messages > 0 and (": " .. table.concat(messages, " / ")) or "")), { console = messages })
+		end
+		local raw = {}
+		for line in f:lines() do
+			local a, text = line:match("^(%x+):%s?(.*)$")
+			if a then raw[#raw + 1] = { address = tonumber(a, 16), text = (text:gsub("%s+$", "")) } end
+		end
+		f:close()
+		pcall(os.remove, path)
+		if #raw == 0 then
+			return fail("disassembly_failed", "the disassembler wrote no instructions for " .. args.cpu .. " at " .. hex(start), { console = messages })
+		end
+		if raw[1].address ~= start then
+			return fail("disassembly_failed", string.format("the disassembler started at %s, not the requested %s; nothing returned", hex(raw[1].address), hex(start)), { console = messages })
+		end
+		local view_letter = dev.spaces["opcodes"] and "3" or "p"
+		local st = emu.symbol_table(dev)
+		local function bytes_at(letter, a, n)
+			local t = {}
+			for i = 0, n - 1 do
+				local okb, v = pcall(function() return st:memory_value(args.cpu, letter, a + i, 1, true) end)
+				if not okb then return nil, tostring(v) end
+				t[#t + 1] = string.format("%02x", v)
+			end
+			return table.concat(t)
+		end
+		local out_instr, problems, warnings = {}, {}, {}
+		local total = math.min(count, #raw)
+		local differs = false
+		for i = 1, total do
+			local row = { address = hex(raw[i].address), text = raw[i].text }
+			local nxt = raw[i + 1]
+			if nxt then
+				if nxt.address <= raw[i].address then
+					return fail("disassembly_failed", "the disassembler's addresses are not ascending; refusing to derive instruction lengths", { console = messages })
+				end
+				row.length = nxt.address - raw[i].address
+				local b, berr = bytes_at(view_letter, raw[i].address, row.length)
+				row.bytes_hex = b
+				if not b then problems[#problems + 1] = string.format("%s: reading the instruction bytes failed: %s", hex(raw[i].address), berr) end
+				if view_letter == "3" and b then
+					local pb = bytes_at("p", raw[i].address, row.length)
+					if pb and pb ~= b then
+						row.program_view_bytes_hex = pb
+						differs = true
+					end
+				end
+			else
+				row.length = nil
+				row.length_note = "the next instruction lies beyond the end of the address space, so this instruction's length was not derived"
+			end
+			out_instr[#out_instr + 1] = row
+		end
+		local last_row = out_instr[#out_instr]
+		local end_exclusive = nil
+		if last_row.length then end_exclusive = raw[total].address + last_row.length end
+		local mapped_last = end_exclusive and (end_exclusive - 1) or raw[total].address
+		if total < count then
+			warnings[#warnings + 1] = string.format("only %d of the %d requested instructions fit before the end of the address space", total, count)
+		end
+		local bus_bytes = sp.data_width // 8
+		if bus_bytes > 1 and start % bus_bytes ~= 0 then
+			warnings[#warnings + 1] = string.format("the start address is not aligned to the %d-byte bus width; most CPUs cannot execute from here, so the decoding may be meaningless", bus_bytes)
+		end
+		return {
+			cpu = args.cpu, cpu_name = opt(function() return dev.name end), space = "program",
+			address = hex(start), count_requested = count, count_returned = #out_instr,
+			instructions = out_instr,
+			next_address = end_exclusive and hex(end_exclusive) or nil,
+			instruction_view = {
+				used = (view_letter == "3") and "opcodes" or "program",
+				separate_opcode_space = dev.spaces["opcodes"] ~= nil,
+				differs_from_program_view = (view_letter == "3") and differs or nil,
+				note = (view_letter == "3")
+					and "this CPU has an opcodes space (decrypted or otherwise separate instruction fetches); text and bytes come from it. program_view_bytes_hex appears on an instruction only when the program (data) view holds different bytes there."
+					or "this CPU has no separate opcodes space: instructions are fetched from the program space, which is what is decoded and what bytes_hex shows",
+				selectable = false,
+			},
+			address_units = "logical CPU-visible byte addresses (address shift 0); not ROM file offsets and not mirrors-resolved",
+			byte_representation = "bytes_hex: lowercase hex, 2 chars per byte, ascending address order (not endian-swapped), read from the instruction view in the same plugin call as the disassembly",
+			text_source = "MAME 0.289 debugger 'dasm' output for this cpu (the text is MAME's disassembler's, unmodified apart from trailing whitespace)",
+			mapping = map_context(dev, sp, start, mapped_last, "program"),
+			warnings = warnings, problems = problems,
+			limitations = "decoding assumes the instruction stream starts at the requested address; it follows no branches and cannot know the CPU's current mode (e.g. Thumb/ARM, 68000 vs ColdFire variants share one decoder per device). Data decoded as code is shown as code.",
+			execution = exec_state(), clock = emu_clock(),
+		}
 	end
 
 	---------------------------------------------------------------------------

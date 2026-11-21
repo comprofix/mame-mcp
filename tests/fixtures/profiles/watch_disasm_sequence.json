@@ -1,0 +1,83 @@
+{
+  "_comment": "Machine-specific addresses and expectations for the capture_watchpoint, disassemble_memory and press_sequence validation (scripts/validate_watchpoint.py, validate_disasm.py, validate_sequence.py, mcp_wds_e2e.py, mcp_bank_capture_e2e.py). Bytes come from the local MAME 0.289 ROM sets and were read with MAME itself; nothing here is a claim about other ROM sets or MAME versions.",
+  "shinobi": {
+    "z80": {
+      "cpu": ":soundcpu",
+      "ram": {"space": "program", "address": "0xF800", "length": "0x800", "note": "work RAM of the Z80; written continuously by the sound program"},
+      "rom_unwritten": {"space": "program", "address": "0x0", "length": "0x100", "note": "program ROM: the CPU never writes here, so a write watchpoint sees no event"},
+      "registers": ["PC", "SP"],
+      "disasm": {"address": "0xAE4", "count": 4, "expected_bytes": ["db01", "cb47", "28fa", "3e15"], "expected_lengths": [2, 2, 2, 2], "note": "idle loop in a,(1) / bit 0,a / jr z / ld a,$15 (bytes read from ROM)"}
+    },
+    "m68k": {
+      "cpu": ":maincpu",
+      "ram": {"space": "program", "address": "0xFFC000", "length": "0x4000", "note": "work RAM, written constantly in attract mode (the 0xC7xxxx range is battery-backed RAM the game does not write there)"},
+      "registers": ["D0", "SR"],
+      "disasm": {"address": "0x404", "count": 3, "expected_bytes": ["60002466", "60000002", "4e73"], "expected_lengths": [4, 4, 2], "odd_address": "0x405", "note": "level-4 autovector target: bra / bra / rte"},
+      "bank_capture_config": {
+        "system": "shinobi", "cpu": ":maincpu", "registers": ["D0", "SR"], "warmup_seconds": 1.0,
+        "limits": {"max_events": 8, "wall_seconds": 10, "total_wall_seconds": 240},
+        "select": {"space": "program", "address": "0xFFC000", "length": "0x1000", "access": "write"},
+        "sites": [{"address": "0x404", "label": "level-4 interrupt handler (runs every frame)"}],
+        "sample": {"address": "0xFFC000", "size": 2},
+        "disassemble": {"count": 3}
+      }
+    },
+    "input": {
+      "port": ":P1",
+      "b1": {"field": "P1 Button 1", "mask": 2},
+      "b2": {"field": "P1 Button 2", "mask": 4},
+      "left": {"field": "P1 Left", "mask": 128},
+      "note": "active-low port: a field is 'pressed' when its masked bits differ from the idle value"
+    },
+    "no_spaces_device": ":screen"
+  },
+  "1942": {
+    "z80": {
+      "cpu": ":maincpu",
+      "disasm": {"address": "0x10", "count": 5, "expected_bytes": ["e5", "d5", "c5", "f5", "c39601"], "expected_lengths": [1, 1, 1, 1, 3], "note": "RST 10h vector: push hl / push de / push bc / push af / jp $0196 (1- and 3-byte Z80 instructions)"}
+    },
+    "bank": {
+      "window": "0x8000", "select": "0xC806", "select_mask": 3, "bank_tag": ":bank1",
+      "first8": {"0": "84b08431857685d3", "1": "60800a81c4817e82", "2": "dc98ba85c088dc98", "3": "ffffffffffffffff"},
+      "select_watch": {"space": "program", "address": "0xC806", "length": 1, "access": "write"}
+    },
+    "bank_capture_config": {
+      "system": "1942", "cpu": ":maincpu", "registers": ["PC", "A", "HL"], "warmup_seconds": 1.5,
+      "limits": {"max_events": 6, "wall_seconds": 12, "total_wall_seconds": 240},
+      "select": {"space": "program", "address": "0xC806", "length": 1, "access": "write"},
+      "sites": [{"address": "0x11", "label": "per-frame RST 10h handler"}, {"address": "0x2BA2", "label": "after ld (hl),1 at 2BA0"}],
+      "sample": {"address": "0x8000", "size": 1},
+      "signatures": {"0x84": 0, "0x60": 1, "0xDC": 2, "0xFF": 3},
+      "inputs": [{"port": ":SYSTEM", "field": "Coin 1", "start": 0, "frames": 6}, {"port": ":SYSTEM", "field": "1 Player Start", "start": 30, "frames": 6}],
+      "disassemble": {"count": 4},
+      "bank_context": true
+    },
+    "bank_capture_expect": {
+      "site_entries": {"0x11": ["0"], "0x2BA2": ["1"]},
+      "select_values_seen_subset_of": ["0x0", "0x1", "0x2", "0x3"],
+      "note": "observed in attract mode on this ROM set: the per-frame handler runs with entry 0 mapped; the instruction after 'ld (hl),1' at 0x2BA0 runs with entry 1 mapped (first window byte 0x60)"
+    }
+  },
+  "1944": {
+    "m68k": {
+      "cpu": ":maincpu",
+      "warmup_seconds": 10,
+      "read_range": {"space": "program", "address": "0x921C00", "length": "0x1000", "events": 300, "note": "video registers: after about 10 s of attract mode the CPU reads here with byte-lane accesses (upper 0xFF00 and lower 0x00FF) every frame"},
+      "write_range": {"space": "program", "address": "0x921C00", "length": "0x1000", "events": 300, "note": "same registers: written with mixed byte-lane and word accesses every frame"},
+      "word_read_range": {"space": "program", "address": "0xFF0000", "length": "0x10000", "events": 300, "note": "work RAM: the first reads are full 16-bit words"},
+      "disasm": {"address": "0x7EE", "count": 4, "expected_opcode_bytes": ["4a7900921cc4", "6700fff8", "50f900921cc6", "527900921cd0"], "expected_lengths": [6, 4, 6, 6],
+                 "note": "polling loop; the maincpu has an opcodes space holding DECRYPTED instructions, so the program view holds different bytes here"}
+    },
+    "z80": {
+      "cpu": ":audiocpu",
+      "bank": {"window": "0x8000", "select": "0xD003", "bank_tag": ":audiobank", "note": "program map 0x8000-0xBFFF is a bank handler; 0xD003 is the qsound bank-switch write handler"}
+    },
+    "no_debug_device": ":qsound",
+    "bank_capture_config": {
+      "system": "1944", "cpu": ":audiocpu", "registers": ["PC", "A"], "warmup_seconds": 1.0,
+      "limits": {"max_events": 4, "wall_seconds": 10, "total_wall_seconds": 240},
+      "select": {"space": "program", "address": "0xD003", "length": 1, "access": "write"},
+      "disassemble": {"count": 3}
+    }
+  }
+}

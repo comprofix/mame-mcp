@@ -19,6 +19,13 @@ MAX_LOCATIONS = 8  # breakpoint locations per experiment; each is one MAME break
 MAX_WALL_SECONDS = 600
 MAX_INPUT_FIELDS = 8
 MAX_INPUT_FRAMES = 600
+MAX_SEQUENCE_STEPS = 64  # one step = one press of one field (a press and a release: at most 2 transitions per step)
+MAX_SEQUENCE_FRAMES = 3600  # total length of a sequence in emulated frames
+MAX_SEQUENCE_FIELDS = 16  # distinct fields used by one sequence (at most MAX_INPUT_FIELDS of them held at once)
+WATCH_SPACES = ("program", "data", "io")  # the separate opcodes / cpu_space views are not watchable
+WATCH_ACCESS = ("read", "write", "read_write")
+MAX_WATCH_REGISTERS = 6  # a watchpoint also needs temporaries for the hit-time pc, access address and access data
+MAX_DISASM_INSTRUCTIONS = 64
 WRITE_WIDTHS = (1, 2, 4)  # bytes
 MAX_LABEL = 80
 # <run_id>-cp<NNN>: run_id is <system>-<YYYYMMDD>-<HHMMSS>-<6 hex> (session.py); the id alone names the owning session
@@ -172,6 +179,60 @@ def check_locations(locations: Any) -> list[dict[str, Any]]:
     return out
 
 
+# ------------------------------------------------------------------------------------------------ watchpoints
+def watchpoint_args(
+    cpu: str,
+    space: str,
+    address: Any,
+    length: Any,
+    access: str,
+    max_events: Any,
+    max_wall_seconds: Any,
+    registers: list[str] | None = None,
+    label: str | None = None,
+) -> dict[str, Any]:
+    """One explicit memory-access capture: every field is required (no default CPU, space, range or access type).
+
+    `address`/`length` are LOGICAL addresses in `space`, in the space's address units (bytes: address shift 0 is
+    required, the plugin refuses anything else). The range is [address, address + length - 1]; a watchpoint matches the
+    address the CPU issues, so a mirror of the same storage is a different address and needs its own range."""
+    if not isinstance(space, str) or space not in WATCH_SPACES:
+        raise _bad(f"space must be one of {WATCH_SPACES}")
+    if not isinstance(access, str) or access not in WATCH_ACCESS:
+        raise _bad(f"access must be one of {WATCH_ACCESS}")
+    if isinstance(max_wall_seconds, bool) or not isinstance(max_wall_seconds, (int, float)):
+        raise _bad("max_wall_seconds must be a number")
+    if not 0 < max_wall_seconds <= MAX_WALL_SECONDS:
+        raise _bad(f"max_wall_seconds must be in (0, {MAX_WALL_SECONDS}]")
+    regs = list(registers or [])
+    if len(regs) > MAX_WATCH_REGISTERS or not all(isinstance(r, str) and _IDENT.match(r) for r in regs):
+        raise _bad(f"registers must be up to {MAX_WATCH_REGISTERS} plain register names")
+    if len(set(regs)) != len(regs):
+        raise _bad("registers must not repeat a name")
+    start = check_uint(address, "address", maximum=0xFFFFFFFF)
+    size = check_uint(length, "length", minimum=1, maximum=0x100000000)
+    if start + size - 1 > 0xFFFFFFFF:
+        raise _bad("address + length - 1 exceeds 0xFFFFFFFF")
+    out: dict[str, Any] = {
+        "cpu": check_tag(cpu), "space": space, "address": start, "length": size, "access": access,
+        "max_events": check_uint(max_events, "max_events", minimum=1, maximum=MAX_EVENTS),
+        "max_wall_seconds": max_wall_seconds, "registers": regs,
+    }
+    if label:
+        out["label"] = str(label)[:MAX_LABEL]
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ disassembly
+def disassemble_args(cpu: str, address: Any, count: Any) -> dict[str, Any]:
+    """CPU, start address and instruction count are all explicit; the count is bounded (1..MAX_DISASM_INSTRUCTIONS)."""
+    return {
+        "cpu": check_tag(cpu),
+        "address": check_uint(address, "address", maximum=0xFFFFFFFF),
+        "count": check_uint(count, "count", minimum=1, maximum=MAX_DISASM_INSTRUCTIONS),
+    }
+
+
 # ------------------------------------------------------------------------------------------------ memory writes
 def write_memory_args(cpu: str, space: str, address: Any, value: Any, width: Any) -> dict[str, Any]:
     """Every field is explicit: no defaults for the CPU, address space, address, value or width (bytes: 1, 2 or 4)."""
@@ -216,6 +277,51 @@ def press_args(inputs: Any, frames: Any) -> dict[str, Any]:
     if isinstance(frames, bool) or not isinstance(frames, int) or not 1 <= frames <= MAX_INPUT_FRAMES:
         raise _bad(f"frames must be an integer 1..{MAX_INPUT_FRAMES} (emulated frames)")
     return {"inputs": out, "frames": frames}
+
+
+def sequence_args(steps: Any) -> dict[str, Any]:
+    """Validate a whole input sequence before anything is pressed (the plugin repeats every check).
+
+    Each step presses one digital field for `frames` emulated frames starting `start` frames after the sequence origin.
+    Rules: the earliest step starts at offset 0; steps of one field never overlap or touch (>= 1 idle frame between them);
+    at most MAX_INPUT_FIELDS fields are held at once; <= MAX_SEQUENCE_STEPS steps, <= MAX_SEQUENCE_FIELDS distinct fields,
+    total length <= MAX_SEQUENCE_FRAMES."""
+    if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_SEQUENCE_STEPS:
+        raise _bad(f"steps must be a list of 1..{MAX_SEQUENCE_STEPS} objects with 'port', 'field', 'start' and 'frames'")
+    out: list[dict[str, Any]] = []
+    for i, item in enumerate(steps):
+        if not isinstance(item, dict) or set(item) != {"port", "field", "start", "frames"}:
+            raise _bad(f"steps[{i}] must be an object with exactly 'port', 'field', 'start' and 'frames'")
+        port, name = check_tag(item["port"]), item["field"]
+        if not isinstance(name, str) or not _FIELD_NAME.fullmatch(name):
+            raise _bad(f"steps[{i}].field must be 1-64 printable ASCII characters (a field name from list_inputs)")
+        for k in ("start", "frames"):
+            if isinstance(item[k], bool) or not isinstance(item[k], int):
+                raise _bad(f"steps[{i}].{k} must be an integer number of emulated frames")
+        start, frames = item["start"], item["frames"]
+        if start < 0:
+            raise _bad(f"steps[{i}].start must be >= 0")
+        if not 1 <= frames <= MAX_INPUT_FRAMES:
+            raise _bad(f"steps[{i}].frames must be 1..{MAX_INPUT_FRAMES}")
+        if start + frames > MAX_SEQUENCE_FRAMES:
+            raise _bad(f"steps[{i}] ends at frame offset {start + frames}; a sequence spans at most {MAX_SEQUENCE_FRAMES} emulated frames")
+        out.append({"port": port, "field": name, "start": start, "frames": frames})
+    if len({(s["port"], s["field"]) for s in out}) > MAX_SEQUENCE_FIELDS:
+        raise _bad(f"a sequence may use at most {MAX_SEQUENCE_FIELDS} distinct fields")
+    if min(s["start"] for s in out) != 0:
+        raise _bad("the earliest step must start at frame offset 0 (offsets are relative to the first observed press)")
+    by_field: dict[tuple[str, str], list[tuple[int, int, int]]] = {}
+    for i, s in enumerate(out):
+        by_field.setdefault((s["port"], s["field"]), []).append((s["start"], s["start"] + s["frames"], i))
+    for (port, name), wins in by_field.items():
+        wins.sort()
+        for (s0, e0, i0), (s1, _e1, i1) in zip(wins, wins[1:]):
+            if s1 <= e0:
+                raise _bad(f"steps {i0} and {i1} press {port}/{name} with overlapping or touching windows; leave at least one idle frame between two presses of one field")
+    peak = max(sum(1 for o in out if o["start"] <= s["start"] < o["start"] + o["frames"]) for s in out)
+    if peak > MAX_INPUT_FIELDS:
+        raise _bad(f"{peak} fields would be held at once; at most {MAX_INPUT_FIELDS} may be held together")
+    return {"steps": out}
 
 
 # ------------------------------------------------------------------------------------------------ checkpoints

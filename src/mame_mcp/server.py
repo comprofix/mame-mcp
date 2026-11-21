@@ -76,9 +76,13 @@ mcp = MCPServer(
         "capture_breakpoint starts an asynchronous, limit-bounded experiment inside MAME: poll "
         "experiment_status. Detailed events are written to JSONL evidence files, not returned here. "
         "Experiment ids belong to one session; ids from an earlier session are refused. "
+        "capture_watchpoint is the same kind of experiment for ONE explicit memory range and access type (events carry the logical "
+        "access address, data, hit-time PC and chosen registers, never a bank id). disassemble_memory decodes instructions of a "
+        "stopped CPU through the view MAME decodes (opcodes space when it exists) and reports the address-map and bank context. "
         "CPU addresses are not ROM file offsets: banked memory means one CPU address can map to different code. "
         "Gameplay checkpoints (managed sessions only): list_inputs shows the machine's real digital inputs; press_inputs "
-        "holds them for a bounded number of EMULATED frames (nothing elapses while stopped); save_checkpoint / "
+        "holds them for a bounded number of EMULATED frames and press_sequence runs a validated frame-offset schedule of such "
+        "presses (nothing elapses while stopped, neither advances emulation); save_checkpoint / "
         "load_checkpoint need paused or debugger-stopped execution, no active capture and no held input, and a load makes "
         "every earlier experiment id stale; write_memory changes one explicit RAM location (stopped execution only, "
         "plain RAM only) and reads it back. list_screens / capture_screenshot return the emulated game screen as a PNG image plus its "
@@ -301,6 +305,55 @@ async def capture_breakpoint(
 
 
 @mcp.tool()
+async def capture_watchpoint(
+    cpu: str,
+    space: Literal["program", "data", "io"],
+    address: int | str,
+    length: int,
+    access: Literal["read", "write", "read_write"],
+    max_events: int,
+    max_wall_seconds: float,
+    registers: list[str] | None = None,
+    label: str | None = None,
+) -> dict[str, Any]:
+    """Start an asynchronous, bounded capture of memory accesses to ONE explicit range of `cpu`'s address `space`.
+    Everything is required: `cpu` (device tag), `space` (program, data or io; the space must have byte addresses,
+    i.e. address shift 0), `address` and `length` (the watched range is [address, address+length-1], LOGICAL CPU-visible
+    byte addresses), `access` (read, write or read_write), `max_events` (1..10000) and `max_wall_seconds` (<=600).
+    A watchpoint matches the address the CPU issues: a mirror of the same storage is a different address and needs its own
+    range, and no bank is ever inferred. Each event records the access type (a literal baked into the read or write
+    watchpoint that fired; read_write installs both), the byte-precise access `address` (not the range start), the transferred
+    `data` (value read or written, shifted to the low bits; MAME does not report the access width) and the hit-time
+    instruction `pc` (CURPC: the executing instruction, not the prefetch-adjusted PC), plus up to 6 chosen `registers` read
+    at the hit. There is NO bank id on an event: the logical address alone does not say which bank was selected, and the
+    result never attributes an event to a bank. Events are ordered by exact sequence numbers; their time fields are
+    harvest-time. The call never changes execution state (paused or debugger-stopped: armed, records nothing until
+    execution_control resume); after each recorded hit execution continues. Same ownership, limits, dropped-event reporting,
+    verified cleanup and `unresolved_instrumentation` / `install_failed` behaviour as capture_breakpoint; only one experiment
+    may be active. Not a debugger interface: no expressions, conditions or commands can be supplied.
+    Returns an experiment_id immediately; poll experiment_status; events are in the JSONL evidence file."""
+    args = _validated(protocol.watchpoint_args, cpu, space, address, length, access, max_events, max_wall_seconds, registers, label)
+    return await anyio.to_thread.run_sync(lambda: _call("capture_watchpoint", args))
+
+
+@mcp.tool()
+async def disassemble_memory(cpu: str, address: int | str, count: int) -> dict[str, Any]:
+    """Disassemble `count` (1..64) instructions of `cpu` starting at the logical program-space byte `address`, through the
+    view MAME itself decodes: the CPU's `opcodes` space when the machine defines one (decrypted or otherwise separate
+    instruction fetches), otherwise the program space; the view used is reported and cannot be selected. Requires paused
+    or debugger-stopped execution (execution_control pause) so the view is stable. Returns, per instruction, its address,
+    MAME's decoded text, its length in bytes and its bytes (lowercase hex, ascending address order) read from that view; a
+    program-view byte string is added only where it differs from the instruction view. Lengths come from consecutive
+    instruction addresses, so variable-length instructions are handled. `mapping` reports the declared address-map handlers
+    covering the range and, for bank handlers, the bank and the entry selected right now - the disassembly shows that
+    entry only. Limits: decoding starts at the given address (no flow following, no CPU mode inference), addresses are
+    logical (not ROM offsets), and a CPU without a debug interface, a program space with an address shift, or an address
+    beyond the space is refused with a typed error. Read-only: it does not change emulation or machine state."""
+    args = _validated(protocol.disassemble_args, cpu, address, count)
+    return await anyio.to_thread.run_sync(lambda: _call("disassemble", args))
+
+
+@mcp.tool()
 async def experiment_status(experiment_id: str | None = None) -> dict[str, Any]:
     """Progress, completion reason, counts (captured / hits observed / dropped), errors, cleanup outcome,
     a compact summary, the last few events and the evidence file paths. Defaults to the latest experiment."""
@@ -345,6 +398,27 @@ async def press_inputs(inputs: list[dict[str, str]], frames: int, wait: bool = T
     wait, and when the bridge client disconnects. Analog, toggle, DIP-switch and configuration fields are refused."""
     try:
         return await anyio.to_thread.run_sync(lambda: manager.press_inputs(inputs, frames, wait, max_wait_s))
+    except BridgeError as e:
+        raise _fail(e) from e
+
+
+@mcp.tool()
+async def press_sequence(steps: list[dict[str, str | int]], wait: bool = True, max_wait_s: float | None = None) -> dict[str, Any]:
+    """Run a frame-based sequence of digital input presses. `steps` is 1..64 objects {"port", "field", "start", "frames"}
+    (port/field from list_inputs): hold that field for `frames` (1..600) EMULATED frames beginning `start` frames after the
+    sequence origin. Origin: offset 0 is the first emulated frame in which the machine reads the offset-0 press(es), the same
+    anchoring as press_inputs, so the earliest step must start at 0. Different fields may overlap (chords); two steps of one
+    field need at least one idle frame between them. At one frame boundary every release is applied before every press (both
+    happen between frames, so the machine sees no order). Limits: total length <= 3600 frames, <= 64 steps (at most 2
+    transitions each), <= 16 distinct fields, <= 8 held at once; the WHOLE sequence is validated before any input is pressed.
+    Like press_inputs it never advances emulation: armed while paused or debugger-stopped, only the offset-0 inputs are held and
+    nothing elapses until execution_control resume; no other state-changing operation is accepted while it runs. With
+    wait=true (default) it returns when the sequence has finished, execution stopped or max_wait_s passed; wait=false returns once
+    armed. Released on completion, release_inputs, error, stop_session, server shutdown and client disconnect. The result reports
+    per-step OBSERVED timing (first/last observed frame offset, frames observed pressed) and every deviation from the schedule; the
+    observations are the bridge's own per-frame port reads, so this is not independent proof of frame-exact timing."""
+    try:
+        return await anyio.to_thread.run_sync(lambda: manager.press_sequence(steps, wait, max_wait_s))
     except BridgeError as e:
         raise _fail(e) from e
 

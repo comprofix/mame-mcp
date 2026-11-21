@@ -247,6 +247,13 @@ class BridgeClient:
     def capture_breakpoint(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.request("capture_breakpoint", args, mutating=True)
 
+    def capture_watchpoint(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self.request("capture_watchpoint", args, mutating=True)
+
+    def disassemble(self, args: dict[str, Any]) -> dict[str, Any]:
+        # never auto-retried, like read_memory: it reads memory through MAME's side-effect-suppressed path and runs a debugger command
+        return self.request("disassemble", args)
+
     def experiment_status(self, experiment_id: str | None = None) -> dict[str, Any]:
         return self.request("experiment_status", {"experiment_id": experiment_id} if experiment_id else {}, retry_safe=True)
 
