@@ -531,6 +531,177 @@ def test_shutdown_is_bounded_when_one_session_hangs(rig, monkeypatch):
     hang.set()
 
 
+def _start_in_thread(rig):
+    out = {}
+
+    def go():
+        try:
+            out["r"] = rig.start()
+        except BridgeError as e:
+            out["e"] = e
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    return t, out
+
+
+def _shutdown_in_thread(rig):
+    out = {}
+    t = threading.Thread(target=lambda: out.update(rep=rig.mgr.shutdown()), daemon=True)
+    t.start()
+    return t, out
+
+
+def test_shutdown_leaves_a_starting_sessions_teardown_to_its_start_thread_and_accounts_for_a_process_launched_meanwhile(rig):
+    a = rig.start()
+    entered, release = threading.Event(), threading.Event()
+    orig = rig._launch
+
+    def slow(**kw):  # the launch is under way when shutdown begins; the process appears only afterwards
+        entered.set()
+        release.wait(5)
+        return orig(**kw)
+
+    rig.mgr._launch = slow
+    ts, so = _start_in_thread(rig)
+    assert entered.wait(2)
+    td, do = _shutdown_in_thread(rig)
+    time.sleep(0.2)
+    assert td.is_alive()  # shutdown waits (bounded) for the start thread instead of tearing the session down itself
+    release.set()
+    td.join(5)
+    ts.join(5)
+    rep = do["rep"]
+    starting = next(r for rid, r in rep["sessions"].items() if rid != a["run_id"])
+    p = rig.procs[-1]
+    assert so["e"].code == "shutting_down" and "r" not in so  # it never became ready
+    assert p.calls == ["terminate"]  # stopped exactly once, by its own start thread: no competing teardown
+    assert starting["owner"] == "start_thread" and starting["start_outcome"] == FAILED and starting["pid"] == p.pid
+    assert starting["process"]["terminated"] is True and starting["cleanup_failures"] == []
+    assert rep["sessions"][a["run_id"]]["process"]["terminated"] is True and rep["cleanup_failures"] == []
+    assert rig.mgr.list_sessions()["sessions"] == []
+
+
+def test_a_start_that_has_not_launched_when_shutdown_begins_launches_nothing(rig, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    orig = rig.mgr._register
+
+    def registered_then_wait(*a, **kw):  # registered (STARTING) but not yet launched when shutdown begins
+        s = orig(*a, **kw)
+        entered.set()
+        release.wait(5)
+        return s
+
+    monkeypatch.setattr(rig.mgr, "_register", registered_then_wait)
+    ts, so = _start_in_thread(rig)
+    assert entered.wait(2)
+    td, do = _shutdown_in_thread(rig)
+    time.sleep(0.2)
+    release.set()
+    td.join(5)
+    ts.join(5)
+    (rep,) = do["rep"]["sessions"].values()
+    assert so["e"].code == "shutting_down" and rig.launches == [] and rig.procs == []
+    assert rep["owner"] == "start_thread" and rep["process"] == {"skipped": "no process was launched"} and rep["cleanup_failures"] == []
+
+
+def test_shutdown_is_bounded_by_a_slow_start_and_that_start_still_stops_what_it_launches(rig, monkeypatch):
+    monkeypatch.setattr(session, "SHUTDOWN_BOUND_S", 0.5)
+    entered, release = threading.Event(), threading.Event()
+    orig = rig._launch
+
+    def slow(**kw):
+        entered.set()
+        release.wait(5)
+        return orig(**kw)
+
+    rig.mgr._launch = slow
+    ts, so = _start_in_thread(rig)
+    assert entered.wait(2)
+    t0 = time.monotonic()
+    rep = rig.mgr.shutdown()
+    assert time.monotonic() - t0 < 3.0
+    (r,) = rep["sessions"].values()
+    assert r["owner"] == "start_thread" and r["timed_out"] is True and any("start still in progress" in f for f in rep["cleanup_failures"])
+    release.set()  # the process appears after shutdown returned: the start thread still sees the shutdown and stops it
+    ts.join(5)
+    assert so["e"].code == "shutting_down" and rig.procs[-1].calls == ["terminate"]
+
+
+# ---------------------------------------------------------------------------------------------- external attachment: session_info
+class FakeExternal:
+    """Minimal stand-in for the externally attached BridgeClient (MAMEMCP_PORT)."""
+
+    def __init__(self, listening=True):
+        self.listening, self.connected, self.session_id, self.calls = listening, False, None, []
+        self.timeouts = self.read_retries = self.stale_discarded = self.wake_posts = 0
+        self.wake, self.default_timeout, self.transport_events = None, 5.0, []
+
+    def connect(self, timeout=15.0):
+        if not self.listening:
+            raise BridgeError("connect_failed", "nobody listening")
+        self.connected, self.session_id = True, "s9-eeeeee"
+        return {}
+
+    def session_info(self):
+        self.calls.append("session_info")
+        return {"machine": {"name": "external-machine"}, "execution": {"state": "running"}}
+
+
+@pytest.fixture
+def ext_server(rig, monkeypatch):
+    from mame_mcp import server
+    ext = FakeExternal()
+    monkeypatch.setattr(server, "manager", rig.mgr)
+    monkeypatch.setattr(server, "_external", ext)
+    monkeypatch.setattr(server, "PORT", 7777)
+    return server, ext
+
+
+MANAGED_KEYS = {"run_id", "pid", "run_dir", "evidence_dir", "last_session", "system", "exit_reason", "failure"}
+
+
+@pytest.mark.parametrize("live", [0, 1, 2, 3])
+def test_session_info_external_reports_only_the_external_attachment_however_many_managed_sessions_exist(ext_server, rig, live):
+    server, ext = ext_server
+    if live:
+        rig.mgr.stop(rig.start()["session_id"])  # also leave an ended session in the history: it must not appear either
+    started = [rig.start() for _ in range(live)]
+    logs = {x["session_id"]: list(rig.client_of(x).log) for x in started}
+    out = server._session_info_blocking("external")
+    sess = out["session"]
+    assert sess["ownership"] == "external" and sess["session_id"] == "external" and sess["state"] == "ready" and sess["port"] == 7777
+    assert not MANAGED_KEYS & set(sess), sess
+    assert out["machine"]["name"] == "external-machine" and ext.calls == ["session_info"]
+    assert all(rig.client_of(x).log == logs[x["session_id"]] for x in started)  # no managed session was asked anything
+
+
+def test_session_info_external_when_nothing_listens_is_not_a_managed_answer(ext_server, rig):
+    server, ext = ext_server
+    rig.start(), rig.start()
+    ext.listening = False
+    sess = server._session_info_blocking("external")["session"]
+    assert sess["state"] == "no_session" and sess["ownership"] == "external" and sess["external_attach"]["available"] is False
+    assert not MANAGED_KEYS & set(sess), sess
+
+
+def test_session_info_external_without_an_attachment_is_refused(ext_server, rig, monkeypatch):
+    server, _ = ext_server
+    monkeypatch.setattr(server, "_external", None)
+    rig.start(), rig.start()
+    with pytest.raises(Exception) as e:
+        server._session_info_blocking("external")
+    assert "unknown_session" in str(e.value)
+
+
+def test_list_checkpoints_names_only_live_sessions_as_live(rig):
+    a, b = rig.start(), rig.start()
+    rig.proc_of(b).rc = 3  # B exits unexpectedly: its record stays (exited, unacknowledged) but it is not live
+    rig.mgr.list_sessions()  # refresh notices the exit
+    out = rig.mgr.list_checkpoints(include_previous_sessions=False)
+    assert out["live_run_ids"] == [a["run_id"]] and out["ended_unacknowledged_run_ids"] == [b["run_id"]]
+
+
 # ---------------------------------------------------------------------------------------------- experiments and checkpoints
 def test_experiment_ids_name_their_session():
     sid = "s1700000001-00000a"

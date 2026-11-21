@@ -543,6 +543,8 @@ class SessionManager(StateOperations):
         return out
 
     def _start_attempt(self, s: Session, rompath: Path, timeout: float, deadline: float) -> dict[str, Any]:
+        if self._shutting_down:  # nothing is launched once shutdown has begun (a launch already under way is caught just after it)
+            raise BridgeError("shutting_down", "the MCP server is shutting down; nothing was launched")
         try:  # production launch: debugger on, production plugin only, no fixture, no test_env, no extra arguments
             proc, info = self._launch(system=s.system, port=s.port, run_dir=s.run_dir, mame_exe=self.cfg.mame_exe,
                                       plugins_dir=self.cfg.mame_plugins, rompath=rompath, debug=True)
@@ -828,12 +830,20 @@ class SessionManager(StateOperations):
                 return None
             self._shutting_down = True
             todo: list[tuple[Session, str]] = []
+            # A session that is still STARTING is torn down by its own start thread, never here: that thread sees _shutting_down
+            # (before launching, after launching and before it can become ready), fails the start and stops exactly the process it
+            # launched (_fail). Tearing it down here as well would race that thread over the same process and could miss a
+            # process launched after this point. Shutdown only waits for it (bounded) and reports what the start thread did.
+            starting: list[Session] = []
             for s in self._sessions.values():
                 prior = s.state
+                if prior == STARTING:
+                    starting.append(s)
+                    continue
                 if prior == READY:
                     s.state = STOPPING
                 todo.append((s, prior))
-            if not todo:
+            if not todo and not starting:
                 return None
             self._cond.wait_for(lambda: all(s.inflight == 0 for s, _ in todo), timeout=2.0)
         reports: dict[str, dict[str, Any]] = {}
@@ -848,6 +858,9 @@ class SessionManager(StateOperations):
         for t in threads:
             t.start()
         end = time.monotonic() + SHUTDOWN_BOUND_S
+        if starting:  # the start threads end on their own (they check _shutting_down); wait for them within the same bound
+            with self._cond:
+                self._cond.wait_for(lambda: all(s.state != STARTING for s in starting), timeout=max(0.0, end - time.monotonic()))
         for t in threads:
             t.join(max(0.0, end - time.monotonic()))
         failures: list[str] = []
@@ -861,5 +874,31 @@ class SessionManager(StateOperations):
                 self._history.append(s.summary())
                 self._sessions.pop(s.run_id, None)
                 failures += [f"{s.session_id or s.run_id}: {f}" for f in rep.get("cleanup_failures") or []]
+            for s in starting:
+                reports[s.run_id] = rep = self._starting_report(s)
+                s.stop_report = rep
+                self._history.append(s.summary())
+                self._sessions.pop(s.run_id, None)
+                failures += [f"{s.session_id or s.run_id}: {f}" for f in rep.get("cleanup_failures") or []]
             self._cond.notify_all()
         return {"sessions": reports, "cleanup_failures": failures}
+
+    @staticmethod
+    def _starting_report(s: Session) -> dict[str, Any]:
+        """Shutdown report for a session that was still starting: what its own start thread did (needs self._cond)."""
+        rep: dict[str, Any] = {"owner": "start_thread", "pid": s.pid}
+        if s.state == STARTING:  # the start did not end within the bound: its thread still owns (and will stop) anything it launched
+            rep.update(timed_out=True, cleanup_failures=[f"start still in progress after {SHUTDOWN_BOUND_S:g} s (pid {s.pid}); "
+                                                         "its own failure handling stops any process it launched"])
+            return rep
+        cleanup = (s.failure or {}).get("cleanup")
+        rep["start_outcome"], rep["cleanup_failures"] = s.state, []
+        if cleanup is None:
+            rep["process"] = {"skipped": "no process was launched"}
+        else:
+            rep["process"] = cleanup
+            if cleanup.get("refused"):
+                rep["cleanup_failures"].append("process was NOT stopped: " + cleanup["refused"])
+            elif cleanup.get("still_running"):
+                rep["cleanup_failures"].append("process did not exit after kill")
+        return rep

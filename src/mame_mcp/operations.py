@@ -42,6 +42,7 @@ if TYPE_CHECKING:  # pragma: no cover
 POLL_S = 0.1                 # polling interval for pending checkpoint / held-input waits
 CHECKPOINT_WAIT_S = 20.0     # the plugin bounds a deferred operation at 10 s host / 90 emulated frames
 EXCLUSIVE_WAIT_S = 30.0
+_LIVE_STATES = ("starting", "ready", "stopping")  # session.LIVE (not imported: session.py imports this module)
 MAX_LISTED_CHECKPOINTS = 100
 MAX_SCANNED_SIDECARS = 400
 SCREENSHOT_TIMEOUT_S = 20.0
@@ -269,16 +270,18 @@ class StateOperations:
             return out
 
     def list_checkpoints(self, include_previous_sessions: bool = True, session_id: "str | Session | None" = None) -> dict[str, Any]:
-        """Checkpoints of every live session and, optionally, of earlier sessions under the runs directory. Reads metadata only;
-        works with no MAME running and never needs a session to be selected. With `session_id` each entry also says whether it is
-        `compatible` with that session (same machine and MAME version), which is what load_checkpoint will require."""
+        """Checkpoints of every session this server holds (live, or ended and not yet acknowledged) and, optionally, of earlier
+        sessions under the runs directory. Reads metadata only; works with no MAME running and never needs a session to be
+        selected. With `session_id` each entry also says whether it is `compatible` with that session (same machine and MAME
+        version), which is what load_checkpoint will require."""
         target: Session | None = None
         if session_id is not None:
             target = self.resolve_managed(session_id)
         with self._cond:
-            live = list(self._sessions.values())
-            live_runs = {s.run_id for s in live}
-            mine = [self._public(m, s) | {"owner_session_id": s.session_id} for s in live for m in s.checkpoints.values()]
+            held = list(self._sessions.values())
+            held_runs = {s.run_id for s in held}
+            live_runs = {s.run_id for s in held if s.state in _LIVE_STATES}
+            mine = [self._public(m, s) | {"owner_session_id": s.session_id, "owner_state": s.state} for s in held for m in s.checkpoints.values()]
         out: list[dict[str, Any]] = sorted(mine, key=lambda r: r["created_utc"] or "", reverse=True)
         scanned = 0
         if include_previous_sessions:
@@ -290,7 +293,7 @@ class StateOperations:
                 pass
             for f in files:
                 scanned += 1
-                if f.parent.parent.name in live_runs:
+                if f.parent.parent.name in held_runs:  # already listed from memory above
                     continue
                 try:
                     meta = json.loads(f.read_text())
@@ -304,6 +307,7 @@ class StateOperations:
                 r["compatible"] = r.get("system") == target.system and (not r.get("mame_version") or not target.mame_version
                                                                          or r["mame_version"] == target.mame_version)
         return {"target_run_id": target.run_id if target is not None else None, "live_run_ids": sorted(live_runs),
+                "ended_unacknowledged_run_ids": sorted(held_runs - live_runs),
                 "checkpoints": out[:MAX_LISTED_CHECKPOINTS], "truncated": len(out) > MAX_LISTED_CHECKPOINTS,
                 "sidecars_scanned": scanned,
                 "note": "load_checkpoint needs an explicit session_id when several sessions are live, and accepts any listed id whose "

@@ -198,14 +198,53 @@ def _external_rom_info() -> dict[str, Any] | None:
         return {"unavailable": True, "reason": str(e)}
 
 
-def _session_info_blocking(session_id: str | None = None) -> dict[str, Any]:
-    try:  # an ambiguous or unknown id is an error: nothing is answered for a session that was not selected
-        session = manager.snapshot(None if session_id == EXTERNAL_ID else session_id)
+def _bridge_client_info(client: BridgeClient) -> dict[str, Any]:
+    return {"timeouts": client.timeouts, "read_only_retries": client.read_retries,
+            "stale_replies_discarded": client.stale_discarded,
+            "wake_configured": client.wake is not None, "wake_posts": client.wake_posts,
+            "wake_last_refusal": getattr(client.wake, "last_refusal", None),
+            "default_timeout_s": client.default_timeout, "retry_safe_ops": sorted(RETRY_SAFE_OPS)}
+
+
+def _external_session_info_blocking() -> dict[str, Any]:
+    """session_info(session_id="external"): ONLY the externally attached MAME. Managed sessions are never selected, consulted or
+    reported here (no managed state, ids or history), so this works and answers the same however many managed sessions exist."""
+    if _external is None:
+        raise _fail(BridgeError("unknown_session", "no external attachment is configured (MAMEMCP_PORT)"))
+    session: dict[str, Any] = {"state": "no_session", "ownership": "external", "session_id": EXTERNAL_ID, "port": PORT,
+                               "config": manager.cfg.public()}
+    out: dict[str, Any] = {}
+    try:
+        with manager.use_session(_external, EXTERNAL_ID) as (client, managed, _s):
+            assert not managed and client is _external
+            try:
+                out = _invoke(client, "session_info")
+            except BridgeError as e:
+                if e.code not in ("connect_failed", "mame_disconnected"):
+                    raise _fail(e) from e  # e.g. session_changed: the agent must see it
+                session["external_attach"] = {"configured": True, "port": PORT, "available": False, "error": e.to_dict()}
+            else:
+                out["bridge_client"] = _bridge_client_info(client)
+                rom = _external_rom_info()
+                if rom and "rom_identity" in out:
+                    out["rom_identity"]["launch_info"] = rom
+                session["state"] = "ready"
     except BridgeError as e:
         raise _fail(e) from e
-    target: str | None = EXTERNAL_ID if session_id == EXTERNAL_ID else session.get("run_id")
+    out["session"] = session
+    return out
+
+
+def _session_info_blocking(session_id: str | None = None) -> dict[str, Any]:
+    if session_id == EXTERNAL_ID:
+        return _external_session_info_blocking()
+    try:  # an ambiguous or unknown id is an error: nothing is answered for a session that was not selected
+        session = manager.snapshot(session_id)
+    except BridgeError as e:
+        raise _fail(e) from e
+    target: str | None = session.get("run_id")
     out: dict[str, Any] = {}
-    if session["state"] in ("ready", "no_session") or target == EXTERNAL_ID:
+    if session["state"] in ("ready", "no_session"):
         try:
             with manager.use_session(_external, target) as (client, managed, _s):
                 try:
@@ -218,22 +257,15 @@ def _session_info_blocking(session_id: str | None = None) -> dict[str, Any]:
                     else:  # external attachment configured but nothing is listening: "no session", not a failure
                         session["external_attach"] = {"configured": True, "port": PORT, "available": False, "error": e.to_dict()}
                 else:
-                    out["bridge_client"] = {
-                        "timeouts": client.timeouts, "read_only_retries": client.read_retries,
-                        "stale_replies_discarded": client.stale_discarded,
-                        "wake_configured": client.wake is not None, "wake_posts": client.wake_posts,
-                        "wake_last_refusal": getattr(client.wake, "last_refusal", None),
-                        "default_timeout_s": client.default_timeout, "retry_safe_ops": sorted(RETRY_SAFE_OPS)}
+                    out["bridge_client"] = _bridge_client_info(client)
                     rom = _rom_info(manager.launch_info(target)) if managed else _external_rom_info()
                     if rom and "rom_identity" in out:
                         out["rom_identity"]["launch_info"] = rom
                     if not managed:
                         session = {"state": "ready", "ownership": "external", "session_id": EXTERNAL_ID, "port": PORT, "config": session["config"],
                                    **({"last_session": session["last_session"]} if "last_session" in session else {})}
-        except BridgeError as e:
-            if target == EXTERNAL_ID and e.code == "unknown_session":
-                raise _fail(e) from e
-            # no session configured, or the state changed under us: the session block explains it
+        except BridgeError:
+            pass  # no session configured, or the state changed under us: the session block explains it
     out["session"] = session
     return out
 
@@ -593,7 +625,8 @@ async def capture_screenshot(screen: str | None = None, session_id: str | None =
 
 @mcp.tool()
 async def list_checkpoints(include_previous_sessions: bool = True, session_id: str | None = None) -> dict[str, Any]:
-    """List checkpoints of every live session and, by default, of earlier sessions under the runs directory (metadata
+    """List checkpoints of every session this server holds (live, or ended and not yet acknowledged; `live_run_ids` names only
+    the live ones) and, by default, of earlier sessions under the runs directory (metadata
     only; works with no MAME running and needs no session). With `session_id`, each entry also reports whether it is
     `compatible` with that session (the machine and MAME version load_checkpoint requires)."""
     try:
