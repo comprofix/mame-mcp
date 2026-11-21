@@ -80,15 +80,28 @@ async def call(s, name, **args) -> dict:
     return body_of(await s.call_tool(name, args))
 
 
+def bridge_ready(b: dict) -> bool:
+    """A server that answers is not the same as its emulator bridge being ready: session_info reports an unreachable external
+    attachment as a SUCCESSFUL result with session.external_attach.available == false (and the connect error next to it)."""
+    ea = (b.get("session") or {}).get("external_attach")
+    return not (ea and ea.get("available") is False)
+
+
 async def wait_ready(s, timeout=90) -> dict | None:
-    """Poll until a call is answered by the plugin (any answer except connect_failed)."""
-    end = time.time() + timeout
+    """Poll session_info until the emulator BRIDGE is ready: the answer is neither an error saying the connection failed nor a
+    result saying the attachment is unavailable. Records the polls and wall time it took (wait_ready.attempts / .elapsed) so a
+    check can require that the SERVER waited for the bridge (first poll) rather than this harness retrying."""
+    t0 = time.time()
+    end = t0 + timeout
     last = None
+    wait_ready.attempts = 0
     while time.time() < end:
+        wait_ready.attempts += 1
         last = await call(s, "session_info")
-        if code_of(last) not in ("connect_failed", "mame_disconnected"):
-            return last
+        if code_of(last) not in ("connect_failed", "mame_disconnected") and bridge_ready(last):
+            break
         await asyncio.sleep(0.5)
+    wait_ready.elapsed = time.time() - t0
     return last
 
 
@@ -193,6 +206,8 @@ async def main() -> int:
         async with mcp_server() as s1:
             first = await wait_ready(s1)
             check("E fresh MCP server process attaches to the running MAME (same session id)", (first.get("bridge") or {}).get("session_id") == sid_d, session=(first.get("bridge") or {}).get("session_id"), error=first.get("_error"))
+            check("E the server itself waited for the debugger-stopped MAME's bridge to re-listen: ready on the FIRST session_info, inside the 10 s connect bound (no harness retry)",
+                  wait_ready.attempts == 1 and wait_ready.elapsed < 10.5, attempts=wait_ready.attempts, elapsed_s=round(wait_ready.elapsed, 2), external_attach=(first.get("session") or {}).get("external_attach"))
             await call(s1, "execution_control", action="resume")
             await asyncio.sleep(1.0)
             cap = await call(s1, "capture_breakpoint", cpu=":maincpu", address=HANDLER, max_events=10000, max_wall_seconds=6, registers=["D0"], label="restart-e2e-E")
@@ -200,13 +215,22 @@ async def main() -> int:
             check("E experiment started (6 s wall limit)", bool(exp_e), experiment=exp_e)
         # the MCP client context closed: the server process was terminated without the experiment finishing
         check("E MAME still alive after the MCP server process ended", proc.poll() is None)
-        await asyncio.sleep(8)
+        # attach again IMMEDIATELY: the plugin has not noticed that the previous client vanished (it needs about 1-3 s), so the new
+        # server's connect has to wait for the re-listen itself; the experiment is polled to its own wall-clock end below
         async with mcp_server() as s2:
             first = await wait_ready(s2, 60)
             si2 = first if code_of(first) is None else await call(s2, "session_info")
             check("E new server process re-attaches to the SAME session (no session_changed)", (si2.get("bridge") or {}).get("session_id") == sid_d,
                   error=first.get("_error"), session=(si2.get("bridge") or {}).get("session_id"))
-            st = await call(s2, "experiment_status", experiment_id=exp_e)
+            check("E immediate re-attach after the killed server: ready on the FIRST session_info, inside the 10 s connect bound (the server waited for the re-listen)",
+                  wait_ready.attempts == 1 and wait_ready.elapsed < 10.5, attempts=wait_ready.attempts, elapsed_s=round(wait_ready.elapsed, 2), external_attach=(si2.get("session") or {}).get("external_attach"))
+            st: dict = {}
+            poll_end = time.time() + 30
+            while time.time() < poll_end:
+                st = await call(s2, "experiment_status", experiment_id=exp_e)
+                if st.get("state") != "running":
+                    break
+                await asyncio.sleep(0.5)
             check("E the experiment kept running inside MAME and finished on its wall-clock limit with verified cleanup",
                   st.get("state") == "completed" and st.get("completion_reason") == "wall_clock_limit" and st["cleanup"]["verified"] and st["counts"]["events_captured"] > 0,
                   summary=st.get("summary"), cleanup=st.get("cleanup"))
