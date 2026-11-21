@@ -1,4 +1,8 @@
-"""Reproducible example experiment (Shinobi): capture the level-4 interrupt handler entry.
+"""EXAMPLE (Shinobi): a reproducible experiment that captures the level-4 interrupt handler entry.
+
+This is not an MCP tool and not part of the regression harnesses (scripts/): it drives the Python bridge client directly, without the
+MCP server, to show what one bounded capture looks like. The address, registers and expected result are Shinobi's (68000).
+Usage:  .venv\\Scripts\\python -I examples\\example_experiment.py
 
 What it does, with MAME 0.289 and shinobi.zip:
   1. launches an isolated MAME (runs/example/run), loads the mamemcp plugin;
@@ -13,16 +17,19 @@ the address is read from the running machine here, in the experiment script.
 import json
 import sys
 import time
+from pathlib import Path
 
 from mame_mcp.bridge import BridgeClient
 from mame_mcp.launcher import PROJECT_ROOT, launch
 from mame_mcp.protocol import capture_args, read_memory_args
 
+MAME_DIR = Path(r"D:\arcade\mame")  # holds mame.exe (MAME 0.289)
+ROMPATH = Path(r"D:\arcade\mame\ROMS")  # the ROM collection (read only)
 PORT = 9466
 
 
 def main() -> int:
-    proc, info = launch(port=PORT, run_dir=PROJECT_ROOT / "runs" / "example" / "run")
+    proc, info = launch(system="shinobi", port=PORT, run_dir=PROJECT_ROOT / "runs" / "example" / "run", mame_dir=MAME_DIR, rompath=ROMPATH)
     c = BridgeClient(port=PORT)
     try:
         si = c.connect(timeout=40)
