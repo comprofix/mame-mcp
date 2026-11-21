@@ -59,3 +59,36 @@ def test_pid_source_is_reread_every_call(monkeypatch):
     assert w() == 0 and p.posted == [10]
     cur["v"] = None
     assert w() == 0
+
+
+# --- the bridge port is unheld while the plugin is between connections (measured on MAME 0.289) ---------------------------------
+def test_exact_identity_is_nudged_while_nobody_holds_the_bridge_port(monkeypatch):
+    """After a client vanished, MAME's socket is gone until its plugin re-listens, and a debugger-stopped MAME runs the plugin only
+    when nudged: refusing here would deadlock the reconnect."""
+    p = Probe(monkeypatch, {10: (MAME_A, 111)}, {})
+    w = winwake.waker_for(lambda: (10, 111), port=9411)
+    assert w() == 1 and p.posted == [10] and w.last_refusal is None
+
+
+def test_unheld_port_does_not_help_a_pid_only_configuration(monkeypatch):
+    p = Probe(monkeypatch, {10: (MAME_A, 111)}, {})
+    w = winwake.waker_for(10, port=9411)  # no creation time: the port is the only binding, so it must be owned
+    assert w() == 0 and p.posted == [] and "does not own" in w.last_refusal
+
+
+def test_unheld_port_does_not_help_a_recycled_pid(monkeypatch):
+    p = Probe(monkeypatch, {10: (MAME_A, 222)}, {})
+    w = winwake.waker_for(lambda: (10, 111), port=9411)
+    assert w() == 0 and p.posted == [] and "creation time" in w.last_refusal
+
+
+def test_unheld_port_does_not_help_a_non_mame_image(monkeypatch):
+    p = Probe(monkeypatch, {10: (r"C:\Windows\notepad.exe", 111)}, {})
+    w = winwake.waker_for(lambda: (10, 111), port=9411)
+    assert w() == 0 and p.posted == [] and "not mame" in w.last_refusal
+
+
+def test_port_held_by_another_process_is_refused_even_with_an_exact_identity(monkeypatch):
+    p = Probe(monkeypatch, {10: (MAME_A, 111), 20: (MAME_A, 333)}, {9411: [20]})
+    w = winwake.waker_for(lambda: (10, 111), port=9411)  # exact identity, but a different process holds THIS bridge port
+    assert w() == 0 and p.posted == [] and "does not own" in w.last_refusal

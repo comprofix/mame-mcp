@@ -17,10 +17,10 @@ from mame_mcp.protocol import BridgeError
 class FakeBridge:
     """Replies per a script: each handler gets the request dict and returns list[str] lines to send (or None to stay silent)."""
 
-    def __init__(self, handler):
+    def __init__(self, handler, port=0):
         self.handler = handler
         self.srv = socket.socket()
-        self.srv.bind(("127.0.0.1", 0))
+        self.srv.bind(("127.0.0.1", port))
         self.srv.listen(2)
         self.port = self.srv.getsockname()[1]
         self.received = []
@@ -246,3 +246,59 @@ def test_wake_hook_runs_only_while_waiting_and_failures_are_contained():
     state["armed"] = True
     assert c.request("session_info", timeout=5) == {"x": 1}
     assert state["calls"] >= 2 and c.wake_posts >= 1
+
+# --- reconnect to a MAME whose plugin has not re-listened yet (debugger-stopped: it runs only when nudged) -----------------------
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_connect_nudges_a_stopped_mame_until_it_listens_and_sends_only_the_handshake():
+    port, state = _free_port(), {"wakes": 0, "bridge": None}
+
+    def wake():  # the plugin re-listens from a periodic callback, which runs only after the Nth nudge
+        state["wakes"] += 1
+        if state["wakes"] == 3 and state["bridge"] is None:
+            state["bridge"] = FakeBridge(lambda r: [ok(r, "S1")], port=port)
+        return 1
+
+    c = BridgeClient(port=port, wake=wake)
+    t0 = time.monotonic()
+    info = c.connect(timeout=8)
+    assert info == {"x": 1} and c.session_id == "S1" and state["wakes"] == 3 and c.wake_posts == 3
+    assert time.monotonic() - t0 < 4
+    assert [r["op"] for r in state["bridge"].received] == ["session_info"]  # nothing but the read-only handshake was sent
+    c.close(graceful=False)
+
+
+def test_connect_without_a_wake_hook_stays_bounded_and_reports_connect_failed():
+    c = BridgeClient(port=_free_port())
+    t0 = time.monotonic()
+    with pytest.raises(BridgeError) as e:
+        c.connect(timeout=1.0)
+    assert e.value.code == "connect_failed" and time.monotonic() - t0 < 3 and c.wake_posts == 0 and not c.connected
+
+
+def test_connect_nudges_are_rate_limited_bounded_by_the_deadline_and_failures_are_contained():
+    calls = []
+
+    def wake():
+        calls.append(time.monotonic())
+        raise RuntimeError("a failing nudge must never break connect")
+
+    c = BridgeClient(port=_free_port(), wake=wake)
+    t0 = time.monotonic()
+    with pytest.raises(BridgeError) as e:
+        c.connect(timeout=1.6)
+    assert e.value.code == "connect_failed" and time.monotonic() - t0 < 4
+    assert 2 <= len(calls) <= 7 and all(b - a >= 0.24 for a, b in zip(calls, calls[1:]))  # about 4 per second, none while it was answered
+
+
+def test_connect_does_not_nudge_a_mame_that_answers_at_once():
+    fb = FakeBridge(lambda r: [ok(r, "S1")])
+    woken = []
+    c = BridgeClient(port=fb.port, wake=lambda: woken.append(1) or 1)
+    c.connect(timeout=3)
+    assert woken == [] and c.wake_posts == 0
+    c.close(graceful=False)

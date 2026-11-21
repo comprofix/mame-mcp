@@ -64,14 +64,23 @@ class BridgeClient:
         """
         with self._lock:
             self.close(graceful=False)
-            deadline = time.monotonic() + timeout
+            t_start = time.monotonic()
+            deadline = t_start + timeout
             last: BridgeError | OSError | None = None
             old = self.session_id
+            last_wake = 0.0
             while time.monotonic() < deadline:
                 try:
                     self._sock = socket.create_connection((self.host, self.port), timeout=1.0)
                 except OSError as e:
                     last = e
+                    # Nobody is listening. After a client vanished, MAME's plugin re-listens only from a periodic callback, and a
+                    # debugger-stopped MAME runs those only when nudged (winwake), so nudge here too, at the same rate as while a
+                    # request waits. Bounded by this connect's deadline; the nudge posts a no-op window message and sends nothing.
+                    now = time.monotonic()
+                    if now - t_start > 0.3 and now - last_wake > 0.25:
+                        last_wake = now
+                        self._nudge("connect")
                     time.sleep(0.2)
                     continue
                 self._rbuf = b""
@@ -178,6 +187,18 @@ class BridgeClient:
                 raise BridgeError(err.get("code", "bridge_error"), err.get("message", "unknown error"),
                                   detail=err.get("detail"))
 
+    def _nudge(self, op: str) -> None:
+        """Run the optional wake hook once (callers rate-limit it). A failing hook never breaks the caller."""
+        if self.wake is None:
+            return
+        try:
+            n = self.wake() or 0
+        except Exception:
+            n = 0
+        if n and self.wake_posts == 0:
+            self._note("wake", op, request_id=self.last_request_id)
+        self.wake_posts += n
+
     def _read_line(self, deadline: float, op: str, mutating: bool) -> bytes:
         assert self._sock is not None
         t_wait, last_wake = time.monotonic(), 0.0
@@ -186,13 +207,7 @@ class BridgeClient:
             if self.wake is not None and now - t_wait > 0.3 and now - last_wake > 0.25:
                 # No answer yet: MAME's Windows debugger front-end may be blocked in GetMessage while stopped.
                 last_wake = now
-                try:
-                    n = self.wake() or 0
-                except Exception:  # a failing nudge must never break the request
-                    n = 0
-                if n and self.wake_posts == 0:
-                    self._note("wake", op, request_id=self.last_request_id)
-                self.wake_posts += n
+                self._nudge(op)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 # The connection stays usable; a late reply will be discarded as stale by id.

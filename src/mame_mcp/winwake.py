@@ -10,7 +10,9 @@ This touches only a process that passes ALL of these checks immediately before e
   * its image file name starts with "mame";
   * (when known) its creation time equals the one recorded when the PID was captured (a recycled PID fails);
   * (when a port is given) it owns a TCP socket on the bridge's loopback port, i.e. it is the MAME serving
-    THIS bridge, not another MAME instance and not a stale PID that now belongs to something else.
+    THIS bridge, not another MAME instance and not a stale PID that now belongs to something else. The one exception:
+    when the creation time is known (an exact identity) and NO process holds the port, because the plugin is between
+    connections, the nudge is still allowed; a port held by any other process is always refused.
 It never reads or writes MAME memory and sends no input. It is not general process control.
 """
 from __future__ import annotations
@@ -145,8 +147,16 @@ def verified_target(pid: int, *, created: int | None = None, port: int | None = 
         return False, "image is not mame*"
     if created is not None and creation_time(pid) != created:
         return False, "creation time differs from the recorded one (recycled pid)"
-    if port is not None and pid not in port_owner_pids(port):
-        return False, f"pid does not own a socket on bridge port {port} (another instance or stale pid)"
+    if port is not None:
+        owners = port_owner_pids(port)
+        if pid not in owners:
+            if owners or created is None:
+                return False, f"pid does not own a socket on bridge port {port} (another instance or stale pid)"
+            # Nobody holds the bridge port at all: MAME's plugin closed the departed client's socket and has not re-listened
+            # yet. It re-listens from a periodic callback, which a debugger-stopped MAME runs only when it is nudged, so
+            # refusing here would deadlock the reconnect. The process is still identified exactly (image + the creation time
+            # recorded at launch); a port held by ANY other process, or a pid-only configuration, is still refused above.
+            return True, f"ok (bridge port {port} is not held by any process: the plugin is between connections)"
     return True, "ok"
 
 
