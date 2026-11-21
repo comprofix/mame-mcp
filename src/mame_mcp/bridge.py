@@ -11,7 +11,7 @@ from typing import Any
 from .protocol import PROTOCOL_VERSION, BridgeError
 
 LOOPBACK = "127.0.0.1"
-RETRY_SAFE_OPS = frozenset({"session_info", "read_registers", "experiment_status", "input_status", "checkpoint_status", "list_inputs"})
+RETRY_SAFE_OPS = frozenset({"session_info", "read_registers", "experiment_status", "input_status", "checkpoint_status", "list_inputs", "screen_list"})
 
 
 class BridgeClient:
@@ -261,3 +261,6 @@ class BridgeClient:
 
     def write_memory(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.request("write_memory", args, mutating=True)
+
+    def screen_list(self) -> dict[str, Any]:
+        return self.request("screen_list", {}, retry_safe=True)

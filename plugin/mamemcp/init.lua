@@ -348,7 +348,7 @@ function exports.startplugin()
 				operations = { "session_info", "read_memory", "read_registers", "capture_breakpoint",
 					"experiment_status", "cancel_experiment", "execution_control", "goodbye",
 					"list_inputs", "input_press", "input_status", "input_cancel", "write_memory",
-					"checkpoint_save", "checkpoint_load", "checkpoint_status" },
+					"checkpoint_save", "checkpoint_load", "checkpoint_status", "screen_list", "screenshot" },
 				capture_scope = "breakpoints on the program space of the named cpu; registers are read in the breakpoint condition (that cpu's own symbol table); memory fields use explicitly device-qualified, side-effect-suppressed debugger operators (tag.pb@ etc.). Verified on :maincpu (68000) and :soundcpu (Z80) of shinobi only.",
 			},
 			active_experiment = active and active.id or nil,
@@ -2032,6 +2032,157 @@ function exports.startplugin()
 				elapsed_ms = host_ms() - ckpt_pending.started_host_ms, execution = exec_state() }
 		end
 		return ckpt_last or { state = "none" }
+	end
+
+	---------------------------------------------------------------------------
+	-- screenshots: the emulated game screen as a PNG written by MAME itself (screen:snapshot)
+	---------------------------------------------------------------------------
+	-- MAME renders the snapshot from the screen's last COMPLETED frame (its bitmap is produced when a frame finishes), so the
+	-- image can lag behind screen:frame_number() while running, and after a checkpoint load it still shows the pre-load frame
+	-- until emulation runs again. The frame_done notifier records which frame number the screen was at each time a frame
+	-- finished; comparing that with the frame number at capture time (and the state epoch) classifies the image as
+	-- fresh / behind / stale_after_checkpoint_load / not_rendered. Nothing here resumes, pauses or advances emulation.
+	-- The file name is chosen here (never by the client) and lives under <evidence>/screenshots, which is created on demand.
+	local shots = { seq = 0, rendered = {}, dir = nil, epoch_seen = 0, load_frame = nil }
+
+	emu.register_frame_done(function()
+		pcall(function()
+			for tag, scr in pairs(machine().screens) do
+				local f = scr:frame_number()
+				if shots.epoch_seen ~= epoch then  -- first completed frame after a checkpoint load: MAME re-renders at load time
+					shots.epoch_seen, shots.load_frame = epoch, f
+				end
+				local prev = shots.rendered[tag]
+				shots.rendered[tag] = { frame = f, epoch = epoch, host_ms = host_ms(), emu_time_s = machine().time:as_double(),
+					notifications = (prev and prev.notifications or 0) + 1 }
+			end
+		end)
+	end)
+
+	local function screen_orientation(scr)
+		local v = opt(function() return scr:orientation() end)
+		return type(v) == "number" and v or nil
+	end
+
+	local function screen_entry(tag, scr)
+		local r = shots.rendered[tag]
+		local bounds = opt(function() return { width = scr.width, height = scr.height } end) or {}
+		return {
+			tag = tag, type = opt(function() return tostring(scr.screen_type) end), frame_number = opt(function() return scr:frame_number() end),
+			native_width = bounds.width, native_height = bounds.height, orientation_degrees = screen_orientation(scr),
+			refresh_hz = opt(function() return scr.refresh end),
+			rendered_frame = r and r.frame or nil, frames_rendered_since_start = r and r.notifications or 0,
+		}
+	end
+
+	local function sorted_screens()
+		local list = {}
+		for tag, scr in pairs(machine().screens) do list[#list + 1] = { tag = tag, scr = scr } end
+		table.sort(list, function(a, b) return a.tag < b.tag end)
+		return list
+	end
+
+	function ops.screen_list(args)
+		local out = {}
+		for _, e in ipairs(sorted_screens()) do out[#out + 1] = screen_entry(e.tag, e.scr) end
+		local vm = machine().video
+		return {
+			screens = out, execution = exec_state(), clock = emu_clock(), state_epoch = epoch,
+			video = { frameskip = opt(function() return vm.frameskip end), throttled = opt(function() return vm.throttled end),
+				speed_percent = opt(function() return vm.speed_percent end) },
+			note = "native_width/native_height are the screen's visible area before rotation; orientation_degrees is MAME's screen orientation. "
+				.. "The PNG that capture_screenshot writes is rotated to the displayed orientation (see its output size).",
+		}
+	end
+
+	function ops.screenshot(args)
+		-- read-only with respect to emulation, so held inputs and running captures do not matter; a pending checkpoint does
+		-- (its scheduled save/load is still replacing or reading the machine state)
+		if ckpt_pending then
+			return fail("checkpoint_busy", "capture_screenshot refused: a checkpoint " .. ckpt_pending.kind .. " (" .. ckpt_pending.id .. ") has not finished; poll checkpoint_status")
+		end
+		local list = sorted_screens()
+		if #list == 0 then return fail("no_screen", "this machine has no screen devices (nothing to capture)") end
+		local tag = args.screen
+		local entry
+		if tag == nil then
+			if #list > 1 then
+				local tags = {}
+				for _, s in ipairs(list) do tags[#tags + 1] = s.tag end
+				return fail("screen_required", "this machine has several screens; pass screen=<tag>", { screens = tags })
+			end
+			entry = list[1]
+		else
+			for _, s in ipairs(list) do if s.tag == tag then entry = s end end
+			if not entry then
+				local tags = {}
+				for _, s in ipairs(list) do tags[#tags + 1] = s.tag end
+				return fail("unknown_screen", "no screen with tag " .. tostring(tag), { screens = tags })
+			end
+		end
+		tag = entry.tag
+		local scr = entry.scr
+		local dir = cfg.evidence_dir .. "/screenshots"
+		if not shots.dir then
+			if not mkdir_p(dir) then return fail("evidence_unavailable", "cannot create the screenshot directory " .. dir) end
+			shots.dir = dir
+		end
+		local exec = exec_state()
+		local frame_before = scr:frame_number()
+		local r = shots.rendered[tag]
+		shots.seq = shots.seq + 1
+		local safe = tag:gsub("[^%w]", "_"):gsub("^_+", "")
+		if safe == "" then safe = "screen" end
+		local fname = string.format("shot-%04d-%s-f%d.png", shots.seq, safe, frame_before)
+		local path = dir .. "/" .. fname
+		if lfs.attributes(path, "mode") then
+			return fail("screenshot_exists", "refusing to overwrite an existing screenshot file: " .. fname)
+		end
+		local ok_snap, err = pcall(function() return scr:snapshot(path) end)
+		-- screen:snapshot returns nil on success and an error string on failure
+		if (not ok_snap) or err ~= nil then
+			pcall(os.remove, path)
+			return fail("screenshot_failed", "MAME could not write the snapshot: " .. tostring(err))
+		end
+		local frame_after = scr:frame_number()
+		local attrs = lfs.attributes(path)
+		if not attrs or attrs.mode ~= "file" or (attrs.size or 0) == 0 then
+			return fail("screenshot_failed", "MAME reported success but no PNG was written", { path = path })
+		end
+		local freshness, note
+		if not r then
+			freshness = "not_rendered"
+			note = "no frame had finished rendering when the screenshot was taken, so the image is whatever the screen buffer held (normally blank)"
+		elseif r.epoch ~= epoch then
+			freshness = "stale_after_checkpoint_load"
+			note = "a checkpoint was loaded after the last completed frame: the image shows the screen as it was BEFORE the load. Run emulation for at least one frame (resume, then pause) for an image of the loaded state"
+		elseif shots.load_frame ~= nil and r.frame <= shots.load_frame and frame_before <= shots.load_frame then
+			freshness = "rendered_after_load_not_advanced"
+			note = "MAME re-rendered the screen when the checkpoint was loaded, but no emulated frame has run since. Video state that is "
+				.. "not part of the saved machine state is not restored, so this image can show the picture from BEFORE the load with the loaded "
+				.. "state's colours, or otherwise differ from what the game shows once running (observed on Shinobi, 1944 and 1943kai). "
+				.. "Run emulation for a few frames (resume, then pause) and capture again before relying on the image"
+		elseif r.frame == frame_before then
+			freshness = "fresh"
+			note = "the image is the screen's last completed frame and the screen has not advanced past it"
+		else
+			freshness = "behind"
+			note = "emulation is past the last completed frame (it was captured mid-frame or frames are in flight); the image is the last completed frame"
+		end
+		if frame_before == 0 then
+			note = note .. ". The screen is at frame 0: emulation has not run a frame yet (MAME starts stopped, and ROM loading can delay the first frames after a resume), so a black image is expected and is not a rendering fault"
+		end
+		return {
+			screen = tag, path = path, file = fname, file_size = attrs.size, sequence = shots.seq,
+			image_frame = r and r.frame or nil, image_frame_notifications = r and r.notifications or 0,
+			current_frame = frame_before, frame_after_capture = frame_after, frames_behind = r and (frame_before - r.frame) or nil,
+			freshness = freshness, freshness_note = note,
+			frames_since_load = (shots.load_frame ~= nil and r and r.epoch == epoch) and (r.frame - shots.load_frame) or nil,
+			execution = exec, execution_after = exec_state(), clock = emu_clock(), state_epoch = epoch, rendered_state_epoch = r and r.epoch or nil,
+			native_width = opt(function() return scr.width end), native_height = opt(function() return scr.height end),
+			orientation_degrees = screen_orientation(scr),
+			frameskip = opt(function() return machine().video.frameskip end),
+		}
 	end
 
 	---------------------------------------------------------------------------

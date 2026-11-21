@@ -26,7 +26,10 @@ import sys
 from pathlib import Path
 from typing import Any, Literal
 
+import base64
+
 import anyio
+from mcp_types import CallToolResult, ImageContent, TextContent
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -78,7 +81,9 @@ mcp = MCPServer(
         "holds them for a bounded number of EMULATED frames (nothing elapses while stopped); save_checkpoint / "
         "load_checkpoint need paused or debugger-stopped execution, no active capture and no held input, and a load makes "
         "every earlier experiment id stale; write_memory changes one explicit RAM location (stopped execution only, "
-        "plain RAM only) and reads it back. There is no arbitrary Lua or debugger command execution."
+        "plain RAM only) and reads it back. list_screens / capture_screenshot return the emulated game screen as a PNG image plus its "
+        "evidence path, frame number, execution state and freshness (capture never pauses, resumes or advances emulation; a screenshot "
+        "shows what the screen displayed, not what the game is doing). There is no arbitrary Lua or debugger command execution."
     ),
 )
 
@@ -378,6 +383,40 @@ async def load_checkpoint(checkpoint_id: str) -> dict[str, Any]:
         return await anyio.to_thread.run_sync(lambda: manager.load_checkpoint(checkpoint_id))
     except BridgeError as e:
         raise _fail(e) from e
+
+
+@mcp.tool()
+async def list_screens() -> dict[str, Any]:
+    """List the machine's screens (device tag such as ':screen', type, native visible size before rotation, orientation in
+    degrees, refresh rate, current frame counter and the frame counter at which MAME last finished rendering it) plus the
+    execution state and video settings. Use a tag with capture_screenshot(screen=...). Read-only; needs a running session."""
+    return await anyio.to_thread.run_sync(lambda: _call("screen_list"))
+
+
+@mcp.tool()
+async def capture_screenshot(screen: str | None = None) -> CallToolResult:
+    """Capture the emulated game screen as a PNG and return it as image content together with its evidence path and metadata.
+    `screen` is a screen tag from list_screens; it may be omitted when the machine has exactly one screen. Managed
+    sessions only. The PNG is written by MAME itself to <session evidence dir>/screenshots/shot-NNNN-<screen>-f<frame>.png
+    (unique, never overwritten; a .json sidecar holds the same metadata). The image is the screen only: rotated to the
+    displayed orientation (a vertical game is a portrait image), one pixel per emulated pixel, no bezel, artwork, debugger
+    or desktop. Capture works while running, paused or debugger-stopped and never pauses, resumes or advances emulation.
+    Timing: `frame.image_frame` is the frame counter when MAME last finished rendering the screen and `frame.current_frame` the
+    counter now; `frame.freshness` is 'fresh' (image is the current frame), 'behind' (emulation is past the last rendered
+    frame, as can happen while running), 'not_rendered' (no frame rendered yet), 'stale_after_checkpoint_load' or
+    'rendered_after_load_not_advanced' (a checkpoint load happened and no emulated frame has run since: colours/layers may not
+    match what the game shows once running - resume briefly, pause, and capture again). Repeated captures while paused
+    return the same frame and an identical image. Frame 0 means nothing has been emulated yet, so a black image is expected.
+    A screenshot shows what the screen displayed; it does not by itself establish what the game is doing. Refused while a
+    checkpoint save/load is pending; serialised with checkpoint, input and RAM-write operations and with stop_session."""
+    try:
+        meta, data = await anyio.to_thread.run_sync(lambda: manager.capture_screenshot(screen))
+    except BridgeError as e:
+        raise _fail(e) from e
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(meta, indent=2)),
+                 ImageContent(type="image", data=base64.b64encode(data).decode("ascii"), mime_type="image/png")],
+        structured_content=meta)
 
 
 @mcp.tool()

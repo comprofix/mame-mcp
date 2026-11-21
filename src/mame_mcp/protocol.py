@@ -232,3 +232,17 @@ def check_checkpoint_id(cid: Any) -> re.Match[str]:
     if m is None:
         raise _bad("checkpoint_id must be an id returned by save_checkpoint/list_checkpoints (<run_id>-cpNNN)")
     return m
+
+
+# ------------------------------------------------------------------------------------------------ screenshots
+MAX_SCREEN_TAG = 64
+
+
+def screenshot_args(screen: Any) -> dict[str, Any]:
+    """`screen` is None (the machine's only screen) or a screen device tag such as ':screen' from list_screens. There is
+    deliberately no argument for an output path, size, format or view: the file name and location are chosen by the plugin."""
+    if screen is None:
+        return {}
+    if not isinstance(screen, str) or len(screen) > MAX_SCREEN_TAG or not _TAG.fullmatch(screen):  # fullmatch: "$" would accept a trailing newline
+        raise _bad("screen must be a screen device tag such as ':screen' (see list_screens)")
+    return {"screen": screen}

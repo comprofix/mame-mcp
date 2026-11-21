@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
-from . import protocol
+from . import png, protocol
 from .bridge import BridgeClient
 from .protocol import BridgeError
 
@@ -39,6 +39,9 @@ CHECKPOINT_WAIT_S = 20.0     # the plugin bounds a deferred operation at 10 s ho
 EXCLUSIVE_WAIT_S = 30.0
 MAX_LISTED_CHECKPOINTS = 100
 MAX_SCANNED_SIDECARS = 400
+SCREENSHOT_TIMEOUT_S = 20.0
+MAX_SCREENSHOT_BYTES = 8 << 20
+SCREENSHOT_DIRNAME = "screenshots"  # <evidence_dir>/screenshots; the plugin creates it and chooses every file name
 _HEADER_BYTES = 0x20
 
 
@@ -355,3 +358,79 @@ class StateOperations:
         args = protocol.write_memory_args(cpu, space, address, value, width)
         with self.exclusive("write_memory"), self.use_managed() as (client, _s):
             return client.request("write_memory", args, mutating=True)
+
+    # ------------------------------------------------------------------ screenshots
+    def capture_screenshot(self, screen: Any = None) -> tuple[dict[str, Any], bytes]:
+        """Ask the plugin to write one PNG of the emulated screen into <evidence>/screenshots, then validate it. Returns
+        (metadata, png_bytes). Runs under the same one-at-a-time lock as checkpoints, input presses and RAM writes (so a
+        capture never overlaps a checkpoint load) and as an in-flight call, so stop_session waits for it. It never pauses,
+        resumes or steps emulation: it reports the state it found and whether it was unchanged afterwards."""
+        args = protocol.screenshot_args(screen)
+        with self.exclusive("capture_screenshot"), self.use_managed() as (client, s):
+            res = client.request("screenshot", args, timeout=SCREENSHOT_TIMEOUT_S, mutating=True)
+            path = self._owned_screenshot(s, res.get("path"))
+            data = path.read_bytes()
+            if len(data) > MAX_SCREENSHOT_BYTES:
+                raise BridgeError("screenshot_invalid", f"{path.name} is {len(data)} bytes, above the {MAX_SCREENSHOT_BYTES} limit",
+                                  detail={"path": str(path)})
+            try:
+                info = png.inspect_png(data)
+            except png.PngError as e:
+                raise BridgeError("screenshot_invalid", f"MAME wrote {path.name} but it is not a valid PNG: {e}", detail={"path": str(path)}) from e
+            try:
+                pixels = png.summarise_pixels(data)
+            except png.PngError as e:  # structurally valid but not decodable here: still returned, flagged
+                pixels = {"pixel_summary_unavailable": str(e)}
+            meta = self._screenshot_meta(s, res, path, data, info, pixels)
+            side = path.with_suffix(".json")
+            try:
+                side.write_text(json.dumps(meta, indent=2))
+                meta["sidecar_path"] = str(side)
+            except OSError as e:
+                meta["sidecar_error"] = f"metadata sidecar could not be written: {e}"
+            return meta, data
+
+    @staticmethod
+    def _owned_screenshot(s: "Session", reported: Any) -> Path:
+        if not isinstance(reported, str):
+            raise BridgeError("screenshot_failed", "the plugin reported no screenshot path", uncertain=True)
+        folder = (s.evidence_dir / SCREENSHOT_DIRNAME).resolve()
+        p = Path(reported).resolve()
+        if p.parent != folder or p.suffix.lower() != ".png":
+            raise BridgeError("screenshot_path_outside_session",
+                              f"screenshot {p} is not a PNG directly inside this session's screenshot directory {folder}", uncertain=True)
+        if not p.is_file():
+            raise BridgeError("screenshot_failed", f"MAME reported a screenshot that does not exist: {p}", uncertain=True)
+        return p
+
+    @staticmethod
+    def _screenshot_meta(s: "Session", res: dict[str, Any], path: Path, data: bytes, info: "png.PngInfo",
+                         pixels: dict[str, Any]) -> dict[str, Any]:
+        nw, nh, rot = res.get("native_width"), res.get("native_height"), res.get("orientation_degrees")
+        expect = (nh, nw) if rot in (90, 270) else (nw, nh)
+        matches = None if None in (nw, nh, rot) else (info.width, info.height) == expect
+        before, after = res.get("execution") or {}, res.get("execution_after") or {}
+        unchanged = (res.get("frame_after_capture") == res.get("current_frame") and before.get("state") == after.get("state")) \
+            if before and after else None
+        return {
+            "state": "captured", "system": s.system, "session_id": s.session_id, "run_id": s.run_id, "screen": res.get("screen"),
+            "evidence_path": str(path), "file_name": path.name, "file_size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+            "mime_type": "image/png", "sequence": res.get("sequence"), "captured_utc": _utc(),
+            "image": {**info.summary(), **pixels},
+            "geometry": {
+                "native_width": nw, "native_height": nh, "orientation_degrees": rot,
+                "image_matches_native_after_rotation": matches,
+                "rotation": "the image is rotated to the displayed orientation: a screen MAME rotates 90 or 270 degrees is a portrait image "
+                            "(width and height swapped relative to native_*), not the raw landscape frame buffer",
+                "scaling": "none: one image pixel per emulated screen pixel (no aspect-ratio correction, filtering or zoom)",
+                "cropping": "none beyond MAME's visible area for the screen; no bezel, artwork, overlay, debugger or desktop is included",
+            },
+            "frame": {
+                "image_frame": res.get("image_frame"), "current_frame": res.get("current_frame"), "frames_behind": res.get("frames_behind"),
+                "freshness": res.get("freshness"), "freshness_note": res.get("freshness_note"), "frames_since_load": res.get("frames_since_load"),
+                "meaning": "image_frame is the screen's frame counter when MAME last finished rendering the screen; current_frame is the counter "
+                           "at capture time. The image shows what the screen displayed; it does not by itself establish what the game is doing.",
+            },
+            "execution": before, "execution_after": after, "clock": res.get("clock"),
+            "emulation_unchanged_by_capture": unchanged, "state_epoch": res.get("state_epoch"), "frameskip": res.get("frameskip"),
+        }
