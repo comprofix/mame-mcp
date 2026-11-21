@@ -534,6 +534,10 @@ def test_ownership_accepts_a_configured_executable_reached_through_a_symlink(tmp
 
 # ---------------------------------------------------------------------------------------------- wrapper / runtime identity
 ELF_STUB = b"\x7fELF" + b"\0" * 12
+# Wrapper scripts and ELF runtimes are a POSIX contract: launcher.runtime_executable deliberately returns the launch executable itself
+# on Windows (a .exe is never a `#!` script, and MAMEMCP_MAME_RUNTIME does not apply). The Windows side is asserted separately below.
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="wrapper-script / ELF runtime contract; Windows runs the launch executable itself")
+windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows runtime-identity contract")
 
 
 def _wrapper_rig(tmp_path, *, runtime="configured"):
@@ -552,6 +556,7 @@ def _wrapper_rig(tmp_path, *, runtime="configured"):
     return r
 
 
+@posix_only
 def test_wrapper_launch_with_configured_runtime_is_owned_by_the_runtime_image_only(tmp_path):
     r = _wrapper_rig(tmp_path)
     r.mgr.start("shinobi")
@@ -561,6 +566,7 @@ def test_wrapper_launch_with_configured_runtime_is_owned_by_the_runtime_image_on
     assert rep["process"]["terminated"] is True and "refused" not in rep["process"]
 
 
+@posix_only
 def test_wrapper_image_is_not_accepted_as_the_runtime(tmp_path):
     r = _wrapper_rig(tmp_path)
     r.mgr.start("shinobi")
@@ -605,6 +611,7 @@ def test_creation_time_mismatch_is_refused_at_readiness(tmp_path):
     assert e.value.code == "process_identity_mismatch"
 
 
+@posix_only
 def test_wrapper_without_an_established_runtime_is_refused_before_anything_is_launched(tmp_path):
     r = _wrapper_rig(tmp_path, runtime=None)
     with pytest.raises(BridgeError) as e:
@@ -612,6 +619,7 @@ def test_wrapper_without_an_established_runtime_is_refused_before_anything_is_la
     assert e.value.code == "runtime_unverified" and "MAMEMCP_MAME_RUNTIME" in e.value.message and r.launches == []
 
 
+@posix_only
 def test_configured_runtime_must_be_an_elf_file_and_cannot_redirect_a_plain_executable(tmp_path):
     r = _wrapper_rig(tmp_path)
     (tmp_path / "lib" / "notelf").write_bytes(b"hello")
@@ -619,7 +627,40 @@ def test_configured_runtime_must_be_an_elf_file_and_cannot_redirect_a_plain_exec
         launcher.runtime_executable(r.cfg.exe, tmp_path / "lib" / "notelf")
     with pytest.raises(launcher.RuntimeIdentityError):
         launcher.runtime_executable(r.rt, tmp_path / "bin" / "mame")  # r.rt is not a script: a different runtime is a mismatch
-    assert launcher.runtime_executable(r.rt) == r.rt.resolve()
+
+
+def test_a_plain_executable_is_its_own_runtime(tmp_path):
+    """Portable half of the former combined test: a non-script launch executable is its own (resolved) runtime everywhere."""
+    exe = tmp_path / "bin" / launcher.MAME_EXE_NAME
+    exe.parent.mkdir()
+    exe.write_bytes(ELF_STUB)
+    assert launcher.runtime_executable(exe) == exe.resolve()
+
+
+@windows_only
+def test_windows_runtime_is_the_launch_executable_whatever_is_configured(tmp_path):
+    """No wrapper concept on Windows: even a `#!`-looking file is the runtime itself, and MAMEMCP_MAME_RUNTIME is not consulted."""
+    exe = tmp_path / "mame.exe"
+    exe.write_text("#!/bin/sh\n")
+    other = tmp_path / "other.exe"
+    other.write_bytes(b"MZ")
+    assert launcher.runtime_executable(exe) == exe.resolve()
+    assert launcher.runtime_executable(exe, other) == exe.resolve()
+
+
+@windows_only
+def test_windows_ownership_expects_the_launch_executable_even_with_a_configured_runtime(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    r = _wrapper_rig(tmp_path / "a")  # a configured runtime that would be authoritative on Linux
+    r.rt = None  # the process image is the launch executable, as winwake reports it
+    r.mgr.start("shinobi")
+    rep = r.mgr.stop()
+    assert rep["process"]["terminated"] is True and "refused" not in rep["process"]
+    r2 = _wrapper_rig(tmp_path / "b")  # the process image is the configured runtime: not accepted on Windows
+    with pytest.raises(BridgeError) as e:
+        r2.mgr.start("shinobi")
+    assert e.value.code == "process_identity_mismatch" and "not the expected MAME runtime" in e.value.message
 
 
 def test_runtime_from_env_and_symlinked_wrapper(tmp_path):
