@@ -4,16 +4,36 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from mame_mcp import launcher
 
-# The environment every maintained harness runs against. It is fixed here, not read from the ambient environment, so a
+# The environment every maintained harness runs against. It is fixed here, not read from the general ambient environment, so a
 # stray MAME_DIR / MAMEMCP_* variable cannot silently point a run at a different MAME or ROM collection. Both are only read.
-MAME_DIR = Path(r"D:\arcade\mame")       # holds mame.exe (MAME 0.289)
-ROMPATH = Path(r"D:\arcade\mame\ROMS")   # the ROM collection (1942, 1944, 1943kai and shinobi are used)
+# The Windows reference machine is the default. Another machine states its own installation through the harness-only
+# variables MAMEMCP_HARNESS_MAME_DIR / MAMEMCP_HARNESS_ROMPATH (and MAMEMCP_HARNESS_MAME_RUNTIME for a wrapper-script MAME);
+# off Windows they are required, so a run never guesses an installation.
+_WINDOWS_MAME_DIR = Path(r"D:\arcade\mame")       # holds mame.exe (MAME 0.289)
+_WINDOWS_ROMPATH = Path(r"D:\arcade\mame\ROMS")   # the ROM collection (1942, 1944, 1943kai and shinobi are used)
+
+
+def _harness_path(var: str, windows_default: Path) -> Path:
+    value = os.environ.get(var, "").strip()
+    if value:
+        return Path(value)
+    if sys.platform == "win32":
+        return windows_default
+    raise SystemExit(f"{var} is required on this platform (the built-in default is the Windows reference machine's {windows_default})")
+
+
+MAME_DIR = _harness_path("MAMEMCP_HARNESS_MAME_DIR", _WINDOWS_MAME_DIR)
+ROMPATH = _harness_path("MAMEMCP_HARNESS_ROMPATH", _WINDOWS_ROMPATH)
+MAME_RUNTIME = Path(os.environ["MAMEMCP_HARNESS_MAME_RUNTIME"]) if os.environ.get("MAMEMCP_HARNESS_MAME_RUNTIME", "").strip() else None
+# Passed through to a harness-started server only when set: what a non-Windows MAME needs to open its window.
+DISPLAY_ENV = ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XAUTHORITY")
 
 # The MCP tool surface the server must advertise: exactly these typed tools, no Lua / shell / debugger-command tool.
 EXPECTED_TOOLS = sorted([

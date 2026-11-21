@@ -1,0 +1,23 @@
+{
+  "_comment": "Same-machine variant of multisession.json for a machine whose ROM collection holds only shinobi: three independent shinobi sessions. Every machine-specific fact is the shinobi one from multisession.json / shinobi.json. Checks that need two different machines are reported by the harness as NOT EXERCISED, never as passed.",
+  "sessions": [
+    {"name": "a", "system": "shinobi", "marker": "0xA1"},
+    {"name": "b", "system": "shinobi", "marker": "0xB7"},
+    {"name": "c", "system": "shinobi", "marker": "0xC3"}
+  ],
+  "extra_start": {"system": "shinobi", "note": "started after one session was stopped and a start failed, to show the slot is reusable"},
+  "missing_rom_system": {"system": "pacman", "note": "a system MAME knows whose ROM set is in none of the harness ROM paths (checked in preflight); the harness gives the server an empty pacman folder, so MAME itself fails the start for missing files. No ROM data is created, downloaded or modified."},
+  "shinobi": {
+    "cpu": ":maincpu",
+    "space": "program",
+    "capture": {"address": "0x404", "registers": ["D0", "SR"], "note": "68000 level-4 autovector handler, hit about every frame (shinobi.json maincpu.handler_pc)"},
+    "ram": {"address": "0xC70010", "width": 1, "marker_a": "0xA1", "marker_b": "0xB7", "changed": "0x77", "note": "plain RAM in the declared map (shinobi.json checkpoint_input.ram)"},
+    "rom_read": {"address": "0x0", "length": 8, "note": "68000 vector table: initial SP and PC"},
+    "input": {
+      "press": {"port": ":P1", "field": "P1 Button 1"},
+      "sequence": [{"port": ":P1", "field": "P1 Left", "start": 0, "frames": 30}, {"port": ":P1", "field": "P1 Button 2", "start": 10, "frames": 30}]
+    }
+  },
+  "bounded_capture_events": 240,
+  "long_capture_events": 10000
+}
